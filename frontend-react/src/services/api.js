@@ -1,0 +1,401 @@
+const API = "http://localhost:8000";
+
+// -----------------------------
+// 템플릿 저장
+// -----------------------------
+export async function createTemplate({
+  templateFile,
+  templateName,
+  description = "",
+}) {
+  const fd = new FormData();
+
+  if (!templateFile) {
+    throw new Error("템플릿 파일이 필요합니다.");
+  }
+
+  if (!templateName?.trim()) {
+    throw new Error("템플릿 이름을 입력해주세요.");
+  }
+
+  fd.append("template", templateFile);
+  fd.append("template_name", templateName.trim());
+  fd.append("description", description);
+
+  const res = await fetch(`${API}/api/templates`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(errorText || "템플릿 저장 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 템플릿 목록 조회
+// -----------------------------
+export async function getTemplates() {
+  const res = await fetch(`${API}/api/templates`);
+
+  if (!res.ok) {
+    throw new Error("템플릿 목록 조회 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 조직도 1건 저장
+// -----------------------------
+export async function createOrgMember({
+  name,
+  department = "",
+  title,
+  email,
+}) {
+  const res = await fetch(`${API}/api/org-members`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name,
+      department,
+      title,
+      email,
+    }),
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "조직도 저장 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 조직도 목록 조회
+// -----------------------------
+export async function getOrgMembers() {
+  const res = await fetch(`${API}/api/org-members`);
+
+  if (!res.ok) {
+    throw new Error("조직도 목록 조회 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 조직도 이미지 업로드 후 미리보기
+// -----------------------------
+export async function previewOrgMembersByImage({ imageFile }) {
+  if (!imageFile) {
+    throw new Error("조직도 이미지 파일이 필요합니다.");
+  }
+
+  const fd = new FormData();
+  fd.append("org_image", imageFile);
+
+  const res = await fetch(`${API}/api/org-members/preview-image`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "조직도 이미지 분석 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 미리보기 조직도 저장
+// -----------------------------
+export async function savePreviewOrgMembers(rows = []) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error("저장할 미리보기 데이터가 없습니다.");
+  }
+
+  const res = await fetch(`${API}/api/org-members/save-preview`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ rows }),
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "조직도 일괄 저장 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 결재 방침 1건 저장
+// payload 예시:
+// {
+//   ruleName: "지출결의서 규칙",
+//   ruleText: "50만원 이상 지출은 순차 결재",
+//   templateId: 1,
+//   approvers: [
+//     { approverMemberId: 3, approvalType: "결재" },
+//     { approverMemberId: 5, approvalType: "최종승인" }
+//   ]
+// }
+// -----------------------------
+export async function createApprovalRule({
+  ruleName,
+  ruleText,
+  templateId,
+  approvers = [],
+}) {
+  if (!ruleName?.trim()) {
+    throw new Error("규칙명을 입력해주세요.");
+  }
+
+  if (!ruleText?.trim()) {
+    throw new Error("규칙 내용을 입력해주세요.");
+  }
+
+  if (!templateId) {
+    throw new Error("적용 템플릿을 선택해주세요.");
+  }
+
+  if (!Array.isArray(approvers) || approvers.length === 0) {
+    throw new Error("결재자를 1명 이상 선택해주세요.");
+  }
+
+  const normalizedApprovers = approvers.map((approver, index) => {
+    if (!approver.approverMemberId) {
+      throw new Error(`${index + 1}차 결재자를 선택해주세요.`);
+    }
+
+    return {
+      approver_member_id: Number(approver.approverMemberId),
+      approval_order: index + 1,
+      approval_type: approver.approvalType || "결재",
+    };
+  });
+
+  const res = await fetch(`${API}/api/approval-rules`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      rule_name: ruleName.trim(),
+      rule_text: ruleText.trim(),
+      template_id: Number(templateId),
+      approvers: normalizedApprovers,
+    }),
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "결재 방침 저장 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 결재 방침 목록 조회
+// -----------------------------
+export async function getApprovalRules() {
+  const res = await fetch(`${API}/api/approval-rules`);
+
+  if (!res.ok) {
+    throw new Error("결재 방침 목록 조회 실패");
+  }
+
+  return res.json();
+}
+
+// --------------------------------
+// 결재 방침 미리보기
+// --------------------------------
+export async function previewApprovalRulesByGuide({ guideFile }) {
+  if (!guideFile) {
+    throw new Error("지침서 PDF 파일이 필요합니다.");
+  }
+
+  const fd = new FormData();
+  fd.append("guide_file", guideFile);
+
+  const res = await fetch(`${API}/api/approval-rules/preview-guide`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "지침서 분석 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------------------
+// 결재 방침 미리보기 후 저장
+// -----------------------------------------
+export async function savePreviewApprovalRules(rules = [], sourceName = "") {
+  if (!Array.isArray(rules) || rules.length === 0) {
+    throw new Error("저장할 결재 규칙이 없습니다.");
+  }
+
+  const normalizedRules = rules
+    .filter((rule) => {
+      if (!rule.ruleName || !rule.ruleText || !rule.templateId) {
+        return false;
+      }
+
+      if (!Array.isArray(rule.approvers) || rule.approvers.length === 0) {
+        return false;
+      }
+
+      return rule.approvers.every((a) => a.approverMemberId);
+    })
+    .map((rule) => ({
+      rule_name: rule.ruleName.trim(),
+      rule_text: rule.ruleText.trim(),
+      template_id: Number(rule.templateId),
+      source_excerpt: (rule.sourceExcerpt || "").trim(),
+      approvers: rule.approvers.map((a, index) => ({
+        approver_member_id: Number(a.approverMemberId),
+        approval_order: Number(a.approvalOrder || index + 1),
+        approval_type: a.approvalType || "결재",
+      })),
+    }));
+
+  const res = await fetch(`${API}/api/approval-rules/save-preview`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      source_name: sourceName,
+      rules: normalizedRules,
+    }),
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "결재 처리 방침 일괄 저장 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 여러 결재 방침 일괄 저장
+// rules 형식:
+// [
+//   {
+//     ruleName: "...",
+//     ruleText: "...",
+//     templateId: "1",
+//     approvers: [
+//       { approverMemberId: "3", approvalType: "결재" },
+//       { approverMemberId: "5", approvalType: "최종승인" }
+//     ]
+//   }
+// ]
+// -----------------------------
+export async function saveApprovalRules(rules = []) {
+  const validRules = rules.filter((rule) => {
+    if (!rule.ruleName || !rule.ruleText || !rule.templateId) {
+      return false;
+    }
+
+    if (!Array.isArray(rule.approvers) || rule.approvers.length === 0) {
+      return false;
+    }
+
+    return rule.approvers.every((a) => a.approverMemberId);
+  });
+
+  if (validRules.length === 0) {
+    throw new Error("저장할 결재 처리 방침을 입력해주세요.");
+  }
+
+  const results = [];
+
+  for (const rule of validRules) {
+    const saved = await createApprovalRule({
+      ruleName: rule.ruleName,
+      ruleText: rule.ruleText,
+      templateId: rule.templateId,
+      approvers: rule.approvers,
+    });
+
+    results.push(saved);
+  }
+
+  return {
+    status: "ok",
+    savedRuleCount: results.length,
+    results,
+  };
+}
+
+// -----------------------------
+// 문서 자동 생성
+// -----------------------------
+export async function processExpense({ templateId, desc, receiptFile }) {
+  const fd = new FormData();
+  fd.append("template_id", templateId);
+  fd.append("description", desc);
+
+  if (receiptFile) {
+    fd.append("receipt", receiptFile);
+  }
+
+  const res = await fetch(`${API}/api/process`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "처리 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 이메일 발송
+// -----------------------------
+export async function sendExpenseEmail(result) {
+  const res = await fetch(`${API}/api/send-email`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      document_id: result.document_id,
+      to_email: result.recipient_email,
+      to_name: result.recipient_name,
+      requester: result.expense_data.requester || "작성자",
+      template_name: result.template_name,
+      filled_html: result.filled_html,
+      expense_data: result.expense_data,
+    }),
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "발송 실패");
+  }
+
+  return res.json();
+}

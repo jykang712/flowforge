@@ -1,0 +1,25 @@
+# Backend env
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Python
+backend/__pycache__/
+backend/**/*.pyc
+backend/venv/
+backend/.venv/
+
+# Frontend
+frontend-react/node_modules/
+frontend-react/dist/
+frontend-react/dist-ssr/
+frontend-react/.env
+frontend-react/.env.*
+!frontend-react/.env.example
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
