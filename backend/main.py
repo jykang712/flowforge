@@ -1,7 +1,10 @@
 import json
 import base64
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 from io import BytesIO
+import html as html_lib
 from pypdf import PdfReader
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
@@ -16,12 +19,23 @@ from models import (
     ApprovalRuleApprover,
     GeneratedDocument,
 )
-from openai_service import (
+# 지피티 호출 시 사용 ------------------------------------------------------------------------
+# from openai_service import (
+#     extract_expense_data,
+#     preview_org_members_from_image,
+#     preview_approval_rules_from_guide,
+#     convert_template_to_schema,
+# )
+# --------------------------------------------------------------------------------------------
+
+# 클로드 호출 시 사용 -------------------------------------------------------------------------
+from claude_service import (
     extract_expense_data,
     preview_org_members_from_image,
     preview_approval_rules_from_guide,
     convert_template_to_schema,
 )
+# ---------------------------------------------------------------------------------------------
 from email_service import send_document_email
 
 app = FastAPI()
@@ -39,10 +53,41 @@ async def extract_html_text(file: UploadFile) -> str:
     file_bytes = await file.read()
     return file_bytes.decode("utf-8", errors="ignore")
 
+def render_template_value(value) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, list):
+        lines = []
+
+        for item in value:
+            if isinstance(item, dict):
+                parts = []
+                for k, v in item.items():
+                    if v not in [None, ""]:
+                        parts.append(f"{k}: {v}")
+                lines.append(" / ".join(parts))
+            else:
+                lines.append(str(item))
+
+        return "<br>".join(html_lib.escape(line) for line in lines)
+
+    if isinstance(value, dict):
+        lines = []
+        for k, v in value.items():
+            if v not in [None, ""]:
+                lines.append(f"{k}: {v}")
+        return "<br>".join(html_lib.escape(line) for line in lines)
+
+    return html_lib.escape(str(value))
+
 def fill_template(template: str, data: dict) -> str:
     result = template
     for key, value in data.items():
-        result = result.replace(f"{{{{{key}}}}}", str(value))
+        result = result.replace(
+            f"{{{{{key}}}}}", 
+            render_template_value(value),
+        )
     return result
 
 def _normalize_org_row(row: dict) -> dict:
@@ -61,6 +106,283 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         texts.append(page.extract_text() or "")
 
     return "\n".join(texts).strip()
+
+def match_approval_field_by_title(title: str) -> str | None:
+    title = (title or "").strip()
+
+    # 대표이사는 '대표'와 '이사'가 같이 들어갈 수 있으므로 대표를 먼저 판단
+    if "대표" in title:
+        return "approval_ceo_name"
+
+    if "이사" in title:
+        return "approval_director_name"
+
+    if "부장" in title:
+        return "approval_general_manager_name"
+
+    if "과장" in title:
+        return "approval_manager_name"
+
+    return None
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _clean_extracted_text(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _collect_xml_text(element: ET.Element) -> str:
+    parts = []
+
+    for node in element.iter():
+        name = _xml_local_name(node.tag)
+
+        if name == "t" and node.text:
+            parts.append(node.text)
+        elif name == "tab":
+            parts.append("\t")
+        elif name in {"br", "cr"}:
+            parts.append("\n")
+
+    return _clean_extracted_text("".join(parts))
+
+
+def _extract_docx_table_text(table: ET.Element) -> list[str]:
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    rows = []
+
+    for tr in table.findall("./w:tr", ns):
+        cells = []
+
+        for tc in tr.findall("./w:tc", ns):
+            paragraphs = []
+
+            for paragraph in tc.findall(".//w:p", ns):
+                paragraph_text = _collect_xml_text(paragraph)
+                if paragraph_text:
+                    paragraphs.append(paragraph_text)
+
+            cells.append(" ".join(paragraphs).strip())
+
+        if any(cells):
+            rows.append(" | ".join(cells))
+
+    return rows
+
+
+def extract_docx_text(file_bytes: bytes) -> str:
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    blocks = []
+
+    try:
+        with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+            names = archive.namelist()
+
+            if "word/document.xml" not in names:
+                raise ValueError("word/document.xml을 찾지 못했습니다.")
+
+            xml_targets = ["word/document.xml"]
+            xml_targets += sorted(
+                name
+                for name in names
+                if re.match(r"word/(header|footer)\d+\.xml$", name)
+            )
+
+            for xml_name in xml_targets:
+                root = ET.fromstring(archive.read(xml_name))
+                body = root.find("w:body", ns) if xml_name == "word/document.xml" else root
+
+                if body is None:
+                    body = root
+
+                for child in list(body):
+                    child_name = _xml_local_name(child.tag)
+
+                    if child_name == "p":
+                        text = _collect_xml_text(child)
+                        if text:
+                            blocks.append(text)
+
+                    elif child_name == "tbl":
+                        table_rows = _extract_docx_table_text(child)
+                        if table_rows:
+                            blocks.extend(table_rows)
+    except zipfile.BadZipFile:
+        raise HTTPException(
+            status_code=400,
+            detail="DOCX 파일 형식이 올바르지 않습니다.",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"DOCX 원문을 읽지 못했습니다: {str(e)}",
+        )
+
+    return _clean_extracted_text("\n".join(blocks))
+
+
+def extract_hwpx_text(file_bytes: bytes) -> str:
+    blocks = []
+
+    try:
+        with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+            names = archive.namelist()
+            section_names = sorted(
+                name
+                for name in names
+                if name.startswith("Contents/section") and name.endswith(".xml")
+            )
+
+            if not section_names:
+                section_names = sorted(
+                    name
+                    for name in names
+                    if name.endswith(".xml")
+                    and not name.startswith("META-INF/")
+                    and not name.startswith("Preview/")
+                )
+
+            if not section_names:
+                raise ValueError("HWPX 본문 XML을 찾지 못했습니다.")
+
+            for xml_name in section_names:
+                try:
+                    root = ET.fromstring(archive.read(xml_name))
+                except ET.ParseError:
+                    continue
+
+                paragraph_texts = []
+
+                for node in root.iter():
+                    if _xml_local_name(node.tag) == "p":
+                        text = _collect_xml_text(node)
+                        if text:
+                            paragraph_texts.append(text)
+
+                if paragraph_texts:
+                    blocks.extend(paragraph_texts)
+                else:
+                    text = _collect_xml_text(root)
+                    if text:
+                        blocks.append(text)
+
+    except zipfile.BadZipFile:
+        raise HTTPException(
+            status_code=400,
+            detail="HWPX 파일 형식이 올바르지 않습니다.",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"HWPX 원문을 읽지 못했습니다: {str(e)}",
+        )
+
+    return _clean_extracted_text("\n".join(blocks))
+
+
+async def read_template_source(template: UploadFile) -> tuple[str, str, str]:
+    filename = template.filename or "template"
+    lowered = filename.lower()
+
+    if lowered.endswith(".html") or lowered.endswith(".htm"):
+        source_text = await extract_html_text(template)
+        file_type = "html"
+
+    elif lowered.endswith(".pdf"):
+        file_bytes = await template.read()
+        source_text = extract_pdf_text(file_bytes)
+        file_type = "pdf"
+
+    elif lowered.endswith(".docx"):
+        file_bytes = await template.read()
+        source_text = extract_docx_text(file_bytes)
+        file_type = "docx"
+
+    elif lowered.endswith(".hwpx"):
+        file_bytes = await template.read()
+        source_text = extract_hwpx_text(file_bytes)
+        file_type = "hwpx"
+
+    elif lowered.endswith(".hwp"):
+        raise HTTPException(
+            status_code=400,
+            detail="HWP 파일은 바로 처리하기 어렵습니다. HWPX로 변환한 뒤 업로드해주세요.",
+        )
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="HTML, PDF, DOCX, HWPX 파일만 업로드 가능합니다.",
+        )
+
+    if not source_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="템플릿 원문을 읽지 못했습니다.",
+        )
+
+    return filename, file_type, source_text
+
+
+def parse_json_list_form(value: str, field_name: str) -> list:
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} JSON 형식이 올바르지 않습니다.",
+        )
+
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} 값은 배열이어야 합니다.",
+        )
+
+    return parsed
+
+
+def build_template_fields_from_schema(
+    json_schema: dict,
+    placeholder_keys: list,
+) -> list[dict]:
+    properties = json_schema.get("properties", {}) if isinstance(json_schema, dict) else {}
+    required = set(json_schema.get("required", [])) if isinstance(json_schema, dict) else set()
+
+    fields = []
+
+    for key in placeholder_keys:
+        schema_info = properties.get(key, {})
+        schema_type = schema_info.get("type", "string")
+
+        if schema_type in ["integer", "number"]:
+            ui_type = "number"
+        elif schema_type == "array":
+            ui_type = "array"
+        elif schema_type == "boolean":
+            ui_type = "boolean"
+        else:
+            ui_type = "string"
+
+        fields.append(
+            {
+                "label": schema_info.get("title")
+                or schema_info.get("description")
+                or key,
+                "key": key,
+                "type": ui_type,
+                "required": key in required,
+                "description": schema_info.get("description", ""),
+                "position_hint": "",
+            }
+        )
+
+    return fields
 
 def validate_template_conversion(
     html_template: str,
@@ -206,57 +528,8 @@ def persist_approval_rule(
 def root():
     return {"message": "FastAPI backend is running"}
 
-
-# 템플릿 저장/조회 수정 전---------------------------------------------------------------------------------------------------
-# @app.post("/api/templates")
-# async def create_template(
-#     template: UploadFile = File(...),
-#     template_name: str = Form(...),
-#     description: str = Form(""),
-#     db: Session = Depends(get_db),
-# ):
-#     content = await template.read()
-#     html_text = content.decode("utf-8")
-
-#     new_template = DocumentTemplate(
-#         template_name=template_name.strip(),
-#         file_name=template.filename or "template.html",
-#         html_content=html_text,
-#         description=description.strip(),
-#         is_active=True,
-#     )
-#     db.add(new_template)
-#     db.commit()
-#     db.refresh(new_template)
-
-#     return {
-#         "status": "ok",
-#         "id": new_template.id,
-#         "template_name": new_template.template_name,
-#         "file_name": new_template.file_name,
-#     }
-
-
-# @app.get("/api/templates")
-# def get_templates(db: Session = Depends(get_db)):
-#     templates = (
-#         db.query(DocumentTemplate)
-#         .filter(DocumentTemplate.is_active == True)
-#         .order_by(DocumentTemplate.id.desc())
-#         .all()
-#     )
-
-#     return [
-#         {
-#             "id": t.id,
-#             "template_name": t.template_name,
-#             "file_name": t.file_name,
-#             "description": t.description,
-#         }
-#         for t in templates
-#     ]
-    
 # 템플릿 저장/조회-------------------------------------------------------------------------------------------------------------
+# 기존 방식 호환용: 업로드 즉시 AI 변환 후 저장
 @app.post("/api/templates")
 async def create_template(
     template: UploadFile = File(...),
@@ -264,29 +537,7 @@ async def create_template(
     description: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    filename = template.filename or "template"
-    lowered = filename.lower()
-
-    if lowered.endswith(".html") or lowered.endswith(".htm"):
-        source_text = await extract_html_text(template)
-        file_type = "html"
-
-    elif lowered.endswith(".pdf"):
-        file_bytes = await template.read()
-        source_text = extract_pdf_text(file_bytes)
-        file_type = "pdf"
-
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="HTML 또는 PDF 파일만 업로드 가능합니다."
-        )
-
-    if not source_text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="템플릿 원문을 읽지 못했습니다."
-        )
+    filename, file_type, source_text = await read_template_source(template)
 
     try:
         converted = await convert_template_to_schema(
@@ -297,12 +548,13 @@ async def create_template(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"AI 템플릿 변환 중 오류가 발생했습니다: {str(e)}"
+            detail=f"AI 템플릿 변환 중 오류가 발생했습니다: {str(e)}",
         )
 
     html_template = converted["html_template"]
     json_schema = converted["json_schema"]
     placeholder_keys = converted["placeholder_keys"]
+    fields = converted.get("fields", [])
 
     validate_template_conversion(
         html_template=html_template,
@@ -319,6 +571,7 @@ async def create_template(
         placeholder_keys=json.dumps(placeholder_keys, ensure_ascii=False),
         is_active=True,
     )
+
     db.add(new_template)
     db.commit()
     db.refresh(new_template)
@@ -330,7 +583,173 @@ async def create_template(
         "file_name": new_template.file_name,
         "description": new_template.description,
         "placeholder_keys": placeholder_keys,
+        "fields": fields,
     }
+
+# 미리보기 버튼 클릭 시 템플릿 보여주기 -----------------------------------------------------------------------------------------------------
+@app.get("/api/templates/{template_id}")
+def get_template_detail(
+    template_id: int,
+    db: Session = Depends(get_db),
+):
+    template = (
+        db.query(DocumentTemplate)
+        .filter(
+            DocumentTemplate.id == template_id,
+            DocumentTemplate.is_active == True,
+        )
+        .first()
+    )
+
+    if not template:
+        raise HTTPException(
+            status_code=404,
+            detail="템플릿을 찾을 수 없습니다.",
+        )
+
+    try:
+        placeholder_keys = (
+            json.loads(template.placeholder_keys)
+            if template.placeholder_keys
+            else []
+        )
+    except Exception:
+        placeholder_keys = []
+
+    try:
+        json_schema = (
+            json.loads(template.template_schema)
+            if template.template_schema
+            else {}
+        )
+    except Exception:
+        json_schema = {}
+
+    return {
+        "id": template.id,
+        "template_name": template.template_name,
+        "file_name": template.file_name,
+        "description": template.description,
+        "html_content": template.html_content,
+        "placeholder_keys": placeholder_keys,
+        "fields": build_template_fields_from_schema(
+            json_schema=json_schema,
+            placeholder_keys=placeholder_keys,
+        ),
+    }
+
+# 신규 방식 1단계: AI가 자동 입력 항목 후보와 미리보기 HTML 생성
+@app.post("/api/templates/preview-fields")
+async def preview_template_fields(
+    template: UploadFile = File(...),
+    template_name: str = Form(...),
+    description: str = Form(""),
+):
+    filename, file_type, source_text = await read_template_source(template)
+
+    try:
+        converted = await convert_template_to_schema(
+            source_text=source_text,
+            file_type=file_type,
+            template_name=template_name.strip(),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI 자동 입력 항목 분석 중 오류가 발생했습니다: {str(e)}",
+        )
+
+    html_template = converted["html_template"]
+    json_schema = converted["json_schema"]
+    placeholder_keys = converted["placeholder_keys"]
+    fields = converted.get("fields", [])
+
+    validate_template_conversion(
+        html_template=html_template,
+        json_schema=json_schema,
+        placeholder_keys=placeholder_keys,
+    )
+
+    return {
+        "status": "ok",
+        "file_name": filename,
+        "template_name": template_name.strip(),
+        "description": description.strip(),
+        "html_template": html_template,
+        "preview_html": html_template,
+        "json_schema": json_schema,
+        "placeholder_keys": placeholder_keys,
+        "fields": fields,
+    }
+
+
+# 신규 방식 2단계: 사용자가 확정한 자동 입력 항목으로 최종 저장
+@app.post("/api/templates/save-with-fields")
+async def save_template_with_fields(
+    template: UploadFile = File(...),
+    template_name: str = Form(...),
+    description: str = Form(""),
+    fields: str = Form("[]"),
+    db: Session = Depends(get_db),
+):
+    confirmed_fields = parse_json_list_form(fields, "fields")
+
+    if not confirmed_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="자동 입력 항목을 1개 이상 설정해주세요.",
+        )
+
+    filename, file_type, source_text = await read_template_source(template)
+
+    try:
+        converted = await convert_template_to_schema(
+            source_text=source_text,
+            file_type=file_type,
+            template_name=template_name.strip(),
+            confirmed_fields=confirmed_fields,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"확정 항목 기반 템플릿 저장 중 오류가 발생했습니다: {str(e)}",
+        )
+
+    html_template = converted["html_template"]
+    json_schema = converted["json_schema"]
+    placeholder_keys = converted["placeholder_keys"]
+    normalized_fields = converted.get("fields", [])
+
+    validate_template_conversion(
+        html_template=html_template,
+        json_schema=json_schema,
+        placeholder_keys=placeholder_keys,
+    )
+
+    new_template = DocumentTemplate(
+        template_name=template_name.strip(),
+        file_name=filename,
+        html_content=html_template,
+        description=description.strip(),
+        template_schema=json.dumps(json_schema, ensure_ascii=False),
+        placeholder_keys=json.dumps(placeholder_keys, ensure_ascii=False),
+        is_active=True,
+    )
+
+    db.add(new_template)
+    db.commit()
+    db.refresh(new_template)
+
+    return {
+        "status": "ok",
+        "id": new_template.id,
+        "template_name": new_template.template_name,
+        "file_name": new_template.file_name,
+        "description": new_template.description,
+        "placeholder_keys": placeholder_keys,
+        "fields": normalized_fields,
+    }
+
 
 @app.get("/api/templates")
 def get_templates(db: Session = Depends(get_db)):
@@ -341,16 +760,34 @@ def get_templates(db: Session = Depends(get_db)):
         .all()
     )
 
-    return [
-        {
-            "id": t.id,
-            "template_name": t.template_name,
-            "file_name": t.file_name,
-            "description": t.description,
-            "placeholder_keys": json.loads(t.placeholder_keys) if t.placeholder_keys else [],
-        }
-        for t in templates
-    ]
+    results = []
+
+    for t in templates:
+        try:
+            placeholder_keys = json.loads(t.placeholder_keys) if t.placeholder_keys else []
+        except Exception:
+            placeholder_keys = []
+
+        try:
+            json_schema = json.loads(t.template_schema) if t.template_schema else {}
+        except Exception:
+            json_schema = {}
+
+        results.append(
+            {
+                "id": t.id,
+                "template_name": t.template_name,
+                "file_name": t.file_name,
+                "description": t.description,
+                "placeholder_keys": placeholder_keys,
+                "fields": build_template_fields_from_schema(
+                    json_schema=json_schema,
+                    placeholder_keys=placeholder_keys,
+                ),
+            }
+        )
+
+    return results
     
 # 조직도 저장/조회---------------------------------------------------------------------------------------------------------
 @app.post("/api/org-members")
@@ -820,11 +1257,162 @@ def get_approval_rules(db: Session = Depends(get_db)):
     ]
     
 # 문서 생성---------------------------------------------------------------------------------------------------------
+# @app.post("/api/process")
+# async def process_expense(
+#     template_id: int = Form(...),
+#     description: str = Form(...),
+#     receipt: UploadFile = File(None),
+#     db: Session = Depends(get_db),
+# ):
+#     template = (
+#         db.query(DocumentTemplate)
+#         .filter(
+#             DocumentTemplate.id == template_id,
+#             DocumentTemplate.is_active == True,
+#         )
+#         .first()
+#     )
+#     if not template:
+#         raise HTTPException(status_code=404, detail="선택한 템플릿을 찾을 수 없습니다.")
+
+#     rules = (
+#         db.query(ApprovalRule)
+#         .options(
+#             joinedload(ApprovalRule.approver_maps).joinedload(ApprovalRuleApprover.approver)
+#         )
+#         .filter(
+#             ApprovalRule.template_id == template_id,
+#             ApprovalRule.is_active == True,
+#         )
+#         .order_by(ApprovalRule.id.asc())
+#         .all()
+#     )
+
+#     if not rules:
+#         raise HTTPException(status_code=400, detail="해당 템플릿에 연결된 결재 방침이 없습니다.")
+
+#     org_chart = {}
+#     approval_rule_lines = []
+#     approval_line = []
+
+#     first_approver = None
+#     applied_rule = None
+#     recipient_member = None
+
+#     for rule in rules:
+#         approval_rule_lines.append(f"- {rule.rule_name}: {rule.rule_text}")
+
+#         sorted_maps = sorted(rule.approver_maps, key=lambda x: x.approval_order)
+
+#         for approver_map in sorted_maps:
+#             approver = approver_map.approver
+#             if approver:
+#                 org_chart[approver.name] = {
+#                     "title": approver.title,
+#                     "email": approver.email,
+#                     "approval_order": approver_map.approval_order,
+#                     "approval_type": approver_map.approval_type,
+#                 }
+
+#                 approval_line.append(
+#                     f"{approver_map.approval_order}차 {approver.name} ({approver.title})"
+#                 )
+
+#         # 첫 번째 규칙의 1차 결재자를 기본 수신자로 사용
+#         if not first_approver and sorted_maps:
+#             first_map = sorted_maps[0]
+#             if first_map.approver:
+#                 applied_rule = rule
+#                 first_approver = first_map.approver
+#                 recipient_member = first_map.approver
+
+#     approval_rule_text = "\n".join(approval_rule_lines)
+
+#     if not first_approver:
+#         raise HTTPException(status_code=400, detail="1차 결재자 정보를 찾을 수 없습니다.")
+
+#     receipt_b64 = None
+#     receipt_mime = None
+#     receipt_file_name = None
+#     receipt_content_type = None
+
+#     if receipt:
+#         receipt_bytes = await receipt.read()
+#         receipt_b64 = base64.b64encode(receipt_bytes).decode("utf-8")
+#         receipt_mime = receipt.content_type or "image/jpeg"
+#         receipt_file_name = receipt.filename
+#         receipt_content_type = receipt.content_type
+
+#     if not template.template_schema:
+#         raise HTTPException(status_code=400, detail="선택한 템플릿에 JSON Schema가 저장되어 있지 않습니다.")
+
+#     try:
+#         template_schema = json.loads(template.template_schema)
+#     except Exception:
+#         raise HTTPException(status_code=500, detail="템플릿의 JSON Schema 형식이 올바르지 않습니다.")
+
+#     expense_data = await extract_expense_data(
+#         template_html=template.html_content,
+#         template_name=template.template_name,
+#         template_schema=template_schema,
+#         description=description,
+#         receipt_b64=receipt_b64,
+#         receipt_mime=receipt_mime,
+#         approval_rules=approval_rule_text,
+#         org_chart=org_chart,
+#     )
+
+#     if not isinstance(expense_data, dict):
+#         raise HTTPException(status_code=500, detail="AI 응답 형식이 올바르지 않습니다.")
+
+#     # AI가 결재자를 잘못 내놔도 무시하고 DB 기준 1차 결재자로 덮어씀
+#     expense_data["approver_name"] = first_approver.name
+
+#     # 템플릿에서 결재선 전체를 쓸 수 있도록 보조 필드 추가
+#     expense_data["approval_line"] = ", ".join(approval_line)
+
+#     filled_html = fill_template(template.html_content, expense_data)
+
+#     recipient_name = first_approver.name
+#     recipient_title = first_approver.title
+#     recipient_email = first_approver.email
+
+#     saved_doc = GeneratedDocument(
+#         template_id=template.id,
+#         applied_rule_id=applied_rule.id if applied_rule else None,
+#         recipient_member_id=recipient_member.id if recipient_member else None,
+#         document_title=f"{template.template_name} 자동작성본",
+#         description=description,
+#         receipt_file_name=receipt_file_name,
+#         receipt_content_type=receipt_content_type,
+#         extracted_json=json.dumps(expense_data, ensure_ascii=False),
+#         html_content=filled_html,
+#         recipient_name=recipient_name,
+#         recipient_email=recipient_email,
+#         recipient_title=recipient_title,
+#         is_sent=False,
+#     )
+
+#     db.add(saved_doc)
+#     db.commit()
+#     db.refresh(saved_doc)
+
+#     return {
+#         "document_id": saved_doc.id,
+#         "expense_data": expense_data,
+#         "filled_html": filled_html,
+#         "recipient_name": recipient_name,
+#         "recipient_title": recipient_title,
+#         "recipient_email": recipient_email,
+#         "template_name": template.template_name,
+#         "file_name": template.file_name,
+#     }
+
 @app.post("/api/process")
 async def process_expense(
     template_id: int = Form(...),
     description: str = Form(...),
-    receipt: UploadFile = File(None),
+    receipts: list[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
 ):
     template = (
@@ -835,6 +1423,7 @@ async def process_expense(
         )
         .first()
     )
+
     if not template:
         raise HTTPException(status_code=404, detail="선택한 템플릿을 찾을 수 없습니다.")
 
@@ -852,11 +1441,21 @@ async def process_expense(
     )
 
     if not rules:
-        raise HTTPException(status_code=400, detail="해당 템플릿에 연결된 결재 방침이 없습니다.")
+        raise HTTPException(
+            status_code=400,
+            detail="해당 템플릿에 연결된 결재 방침이 없습니다.",
+        )
 
     org_chart = {}
     approval_rule_lines = []
     approval_line = []
+    
+    approval_field_values = {
+        "approval_manager_name": "",
+        "approval_general_manager_name": "",
+        "approval_director_name": "",
+        "approval_ceo_name": "",
+    }
 
     first_approver = None
     applied_rule = None
@@ -869,6 +1468,7 @@ async def process_expense(
 
         for approver_map in sorted_maps:
             approver = approver_map.approver
+
             if approver:
                 org_chart[approver.name] = {
                     "title": approver.title,
@@ -880,10 +1480,16 @@ async def process_expense(
                 approval_line.append(
                     f"{approver_map.approval_order}차 {approver.name} ({approver.title})"
                 )
+                
+                field_key = match_approval_field_by_title(approver.title)
+
+                if field_key and not approval_field_values[field_key]:
+                    approval_field_values[field_key] = approver.name
 
         # 첫 번째 규칙의 1차 결재자를 기본 수신자로 사용
         if not first_approver and sorted_maps:
             first_map = sorted_maps[0]
+
             if first_map.approver:
                 applied_rule = rule
                 first_approver = first_map.approver
@@ -892,41 +1498,84 @@ async def process_expense(
     approval_rule_text = "\n".join(approval_rule_lines)
 
     if not first_approver:
-        raise HTTPException(status_code=400, detail="1차 결재자 정보를 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=400,
+            detail="1차 결재자 정보를 찾을 수 없습니다.",
+        )
 
-    receipt_b64 = None
-    receipt_mime = None
-    receipt_file_name = None
-    receipt_content_type = None
+    # 여러 영수증 이미지 처리
+    receipt_images = []
+    receipt_file_names = []
+    receipt_content_types = []
 
-    if receipt:
+    for receipt in receipts:
+        if not receipt:
+            continue
+        
+        if receipt.content_type not in ["image/jpeg", "image/png", "image/webp"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"지원하지 않는 파일 형식입니다: {receipt.filename}. JPG, PNG, WEBP 이미지만 업로드해주세요.",
+            )
+
         receipt_bytes = await receipt.read()
-        receipt_b64 = base64.b64encode(receipt_bytes).decode("utf-8")
+
+        if not receipt_bytes:
+            continue
+
         receipt_mime = receipt.content_type or "image/jpeg"
-        receipt_file_name = receipt.filename
-        receipt_content_type = receipt.content_type
+
+        receipt_images.append(
+            {
+                "b64": base64.b64encode(receipt_bytes).decode("utf-8"),
+                "mime": receipt_mime,
+                "file_name": receipt.filename,
+                "content_type": receipt.content_type,
+            }
+        )
+
+        receipt_file_names.append(receipt.filename)
+        receipt_content_types.append(receipt_mime)
+
+    receipt_file_name = ", ".join(receipt_file_names) if receipt_file_names else None
+    receipt_content_type = ", ".join(receipt_content_types) if receipt_content_types else None
 
     if not template.template_schema:
-        raise HTTPException(status_code=400, detail="선택한 템플릿에 JSON Schema가 저장되어 있지 않습니다.")
+        raise HTTPException(
+            status_code=400,
+            detail="선택한 템플릿에 JSON Schema가 저장되어 있지 않습니다.",
+        )
 
     try:
         template_schema = json.loads(template.template_schema)
     except Exception:
-        raise HTTPException(status_code=500, detail="템플릿의 JSON Schema 형식이 올바르지 않습니다.")
+        raise HTTPException(
+            status_code=500,
+            detail="템플릿의 JSON Schema 형식이 올바르지 않습니다.",
+        )
 
     expense_data = await extract_expense_data(
         template_html=template.html_content,
         template_name=template.template_name,
         template_schema=template_schema,
         description=description,
-        receipt_b64=receipt_b64,
-        receipt_mime=receipt_mime,
+        receipt_images=receipt_images,
         approval_rules=approval_rule_text,
         org_chart=org_chart,
     )
 
     if not isinstance(expense_data, dict):
-        raise HTTPException(status_code=500, detail="AI 응답 형식이 올바르지 않습니다.")
+        raise HTTPException(
+            status_code=500,
+            detail="AI 응답 형식이 올바르지 않습니다.",
+        )
+        
+    schema_properties = template_schema.get("properties", {})
+
+    # 결재자 이름 필드는 AI 결과와 무관하게 DB 결재선 기준으로 강제 주입
+    for key, value in approval_field_values.items():
+        if key in schema_properties or f"{{{{{key}}}}}" in template.html_content:
+            expense_data[key] = value    
 
     # AI가 결재자를 잘못 내놔도 무시하고 DB 기준 1차 결재자로 덮어씀
     expense_data["approver_name"] = first_approver.name
@@ -1008,4 +1657,3 @@ async def send_email(payload: dict, db: Session = Depends(get_db)):
             db.commit()
 
     return result
-

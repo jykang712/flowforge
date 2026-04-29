@@ -128,7 +128,8 @@ export default function ProcessPage() {
   const [templates, setTemplates] = useState([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
   const [desc, setDesc] = useState("");
-  const [receiptFile, setReceiptFile] = useState(null);
+  // const [receiptFile, setReceiptFile] = useState(null);
+  const [receiptFiles, setReceiptFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [sending, setSending] = useState(false);
@@ -175,7 +176,8 @@ export default function ProcessPage() {
       const data = await processExpense({
         templateId: selectedTemplateId,
         desc,
-        receiptFile,
+        // receiptFile,
+        receiptFiles,
       });
       setResult(data);
     } catch (e) {
@@ -255,7 +257,7 @@ export default function ProcessPage() {
           <textarea
             value={desc}
             onChange={(e) => setDesc(e.target.value)}
-            placeholder="예: 지난주 금요일 개발팀 강지윤이 거래처 ABC컨설팅과 점심 미팅 후 식대 55,000원을 법인카드로 결제했습니다."
+            placeholder="예: 지난주 금요일 개발팀 홍길동 팀장이 거래처 ABC컨설팅과 점심 미팅 후 식대 55,000원을 법인카드로 결제했습니다."
             style={{ minHeight: 120 }}
           />
         </div>
@@ -265,8 +267,11 @@ export default function ProcessPage() {
           <DropZone
             label="영수증 이미지를 드래그하거나 클릭하여 업로드"
             accept="image/*"
-            file={receiptFile}
-            setFile={setReceiptFile}
+            // file={receiptFile}
+            files={receiptFiles}
+            // setFile={setReceiptFile}
+            setFiles={setReceiptFiles}
+            multiple
             icon="🧾"
           />
         </div>
@@ -371,7 +376,8 @@ export default function ProcessPage() {
               onClick={() => {
                 setResult(null);
                 setDesc("");
-                setReceiptFile(null);
+                // setReceiptFile(null);
+                setReceiptFiles([]);
               }}
             >
               새 문서 작성

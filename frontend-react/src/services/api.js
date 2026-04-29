@@ -48,6 +48,102 @@ export async function getTemplates() {
   return res.json();
 }
 
+export async function getTemplateDetail(templateId) {
+  const res = await fetch(`${API}/api/templates/${templateId}`);
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "템플릿 상세 조회 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 템플릿 자동 입력 항목 미리보기
+// 업로드한 PDF/HTML/DOCX/HWPX를 AI가 분석해서 fields 후보 반환
+// -----------------------------
+export async function previewTemplateFields({
+  templateFile,
+  templateName,
+  description = "",
+}) {
+  const fd = new FormData();
+
+  if (!templateFile) {
+    throw new Error("문서 양식 파일이 필요합니다.");
+  }
+
+  if (!templateName?.trim()) {
+    throw new Error("양식 이름을 입력해주세요.");
+  }
+
+  fd.append("template", templateFile);
+  fd.append("template_name", templateName.trim());
+  fd.append("description", description);
+
+  const res = await fetch(`${API}/api/templates/preview-fields`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "자동 입력 항목 분석 실패");
+  }
+
+  return res.json();
+}
+
+// -----------------------------
+// 사용자가 확정한 자동 입력 항목으로 템플릿 저장
+// -----------------------------
+export async function saveTemplateWithFields({
+  templateFile,
+  templateName,
+  description = "",
+  fields = [],
+}) {
+  const fd = new FormData();
+
+  if (!templateFile) {
+    throw new Error("문서 양식 파일이 필요합니다.");
+  }
+
+  if (!templateName?.trim()) {
+    throw new Error("양식 이름을 입력해주세요.");
+  }
+
+  if (!Array.isArray(fields) || fields.length === 0) {
+    throw new Error("자동 입력 항목을 1개 이상 설정해주세요.");
+  }
+
+  fd.append("template", templateFile);
+  fd.append("template_name", templateName.trim());
+  fd.append("description", description);
+  fd.append("fields", JSON.stringify(fields));
+
+  // if (htmlTemplate) {
+  //   fd.append("html_template", htmlTemplate);
+  // }
+
+  // if (sourceFileName) {
+  //   fd.append("source_file_name", sourceFileName);
+  // }
+
+  const res = await fetch(`${API}/api/templates/save-with-fields`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "템플릿 저장 실패");
+  }
+
+  return res.json();
+}
+
 // -----------------------------
 // 조직도 1건 저장
 // -----------------------------
@@ -350,14 +446,36 @@ export async function saveApprovalRules(rules = []) {
 // -----------------------------
 // 문서 자동 생성
 // -----------------------------
-export async function processExpense({ templateId, desc, receiptFile }) {
+// export async function processExpense({ templateId, desc, receiptFile }) {
+//   const fd = new FormData();
+//   fd.append("template_id", templateId);
+//   fd.append("description", desc);
+
+//   if (receiptFile) {
+//     fd.append("receipt", receiptFile);
+//   }
+
+//   const res = await fetch(`${API}/api/process`, {
+//     method: "POST",
+//     body: fd,
+//   });
+
+//   if (!res.ok) {
+//     const e = await res.json().catch(() => null);
+//     throw new Error(e?.detail || "처리 실패");
+//   }
+
+//   return res.json();
+// }
+
+export async function processExpense({ templateId, desc, receiptFiles = [] }) {
   const fd = new FormData();
   fd.append("template_id", templateId);
   fd.append("description", desc);
 
-  if (receiptFile) {
-    fd.append("receipt", receiptFile);
-  }
+  receiptFiles.forEach((file) => {
+    fd.append("receipts", file);
+  });
 
   const res = await fetch(`${API}/api/process`, {
     method: "POST",

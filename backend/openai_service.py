@@ -43,7 +43,22 @@ def _clean_email(value) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", "", str(value)).strip()
+    
+def _to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
 
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ["true", "yes", "y", "1", "예", "맞음", "동의"]:
+            return True
+        if lowered in ["false", "no", "n", "0", "아니오", "아님", "미동의"]:
+            return False
+
+    return False
 
 def _normalize_org_preview_rows(rows: list) -> list[dict]:
     normalized = []
@@ -213,18 +228,314 @@ def _normalize_template_schema(
         "json_schema": json_schema,
         "placeholder_keys": normalized_keys,
     }
+    
+def _safe_key(value: str, fallback: str = "field") -> str:
+    value = _clean_text(value).lower()
+    value = re.sub(r"[^a-zA-Z0-9_]", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
 
-# PDF,html 형식의 결재서류에 {{키}} 형식의 플레이스 홀더로 변환하는 AI
+    if not value:
+        return fallback
+
+    if re.match(r"^[0-9]", value):
+        value = f"{fallback}_{value}"
+
+    return value
+
+
+def _ui_type_to_schema_type(ui_type: str) -> str:
+    if ui_type in ["number", "amount"]:
+        return "number"
+
+    if ui_type == "array":
+        return "array"
+
+    if ui_type == "boolean":
+        return "boolean"
+
+    return "string"
+
+
+def _schema_type_to_ui_type(schema_type: str, key: str = "") -> str:
+    lowered_key = (key or "").lower()
+
+    if schema_type in ["integer", "number"]:
+        if any(word in lowered_key for word in ["amount", "price", "cost", "total", "vat"]):
+            return "amount"
+        return "number"
+
+    if schema_type == "array":
+        return "array"
+
+    if schema_type == "boolean":
+        return "boolean"
+
+    if any(word in lowered_key for word in ["date", "day"]):
+        return "date"
+
+    return "string"
+
+
+def _normalize_template_fields(
+    fields: list,
+    json_schema: dict,
+    placeholder_keys: list,
+) -> list[dict]:
+    properties = json_schema.get("properties", {})
+    required_keys = set(json_schema.get("required", []))
+
+    if not isinstance(fields, list):
+        fields = []
+
+    field_map = {}
+
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+
+        key = _safe_key(
+            field.get("key")
+            or field.get("field_name")
+            or field.get("code")
+            or "",
+            fallback="field",
+        )
+
+        if key:
+            field_map[key] = field
+
+    normalized = []
+
+    for key in placeholder_keys:
+        schema_info = properties.get(key, {})
+        field_info = field_map.get(key, {})
+
+        label = (
+            field_info.get("label")
+            or field_info.get("field_label")
+            or schema_info.get("title")
+            or schema_info.get("description")
+            or key
+        )
+
+        schema_type = schema_info.get("type", "string")
+
+        ui_type = (
+            field_info.get("type")
+            or _schema_type_to_ui_type(schema_type, key)
+        )
+
+        if ui_type not in ["string", "text", "date", "number", "amount", "array", "boolean"]:
+            ui_type = "string"
+
+        normalized.append(
+            {
+                "label": _clean_text(label),
+                "key": key,
+                "type": ui_type,
+                "required": key in required_keys,
+                "description": _clean_text(
+                    field_info.get("description")
+                    or schema_info.get("description")
+                    or ""
+                ),
+                "position_hint": _clean_text(
+                    field_info.get("position_hint")
+                    or field_info.get("context")
+                    or ""
+                ),
+            }
+        )
+
+    return normalized
+
+
+def _build_schema_from_confirmed_fields(
+    fields: list[dict],
+) -> tuple[dict, list[str], list[dict]]:
+    properties = {}
+    required = []
+    placeholder_keys = []
+    normalized_fields = []
+
+    for index, field in enumerate(fields or []):
+        if not isinstance(field, dict):
+            continue
+
+        label = _clean_text(field.get("label"))
+        key = _safe_key(
+            field.get("key") or label,
+            fallback=f"field_{index + 1}",
+        )
+
+        ui_type = field.get("type") or "string"
+
+        if ui_type not in ["string", "text", "date", "number", "amount", "array", "boolean"]:
+            ui_type = "string"
+
+        schema_type = _ui_type_to_schema_type(ui_type)
+
+        schema_field = {
+            "type": schema_type,
+            "description": _clean_text(field.get("description") or label or key),
+        }
+
+        if ui_type == "array":
+            schema_field["items"] = {"type": "object"}
+
+        properties[key] = schema_field
+        placeholder_keys.append(key)
+
+        if field.get("required"):
+            required.append(key)
+
+        normalized_fields.append(
+            {
+                "label": label or key,
+                "key": key,
+                "type": ui_type,
+                "required": bool(field.get("required")),
+                "description": _clean_text(field.get("description")),
+                "position_hint": _clean_text(field.get("position_hint")),
+            }
+        )
+
+    json_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+    return json_schema, placeholder_keys, normalized_fields
+
+# PDF,html 형식의 결재서류에 {{키}} 형식의 플레이스 홀더로 변환하는 AI 수정 전 -------------------------------------------------------------
+# async def convert_template_to_schema(
+#     source_text: str,
+#     file_type: str,
+#     template_name: str,
+# ) -> dict:
+#     instructions = f"""
+# 너는 회사 결재서류 템플릿 정규화 AI이다.
+
+# 입력 문서는 {file_type} 원문이다.
+# 이 문서를 재사용 가능한 HTML 템플릿과 JSON 스키마로 변환해야 한다.
+
+# 반드시 아래 JSON 객체 형식으로만 응답하라.
+# 설명, 해설, 코드블록, 마크다운 없이 순수 JSON만 출력하라.
+
+# 출력 형식:
+# {{
+#   "html_template": "<html>...</html>",
+#   "json_schema": {{
+#     "type": "object",
+#     "properties": {{
+#       "field_name": {{ "type": "string" }}
+#     }},
+#     "required": ["field_name"],
+#     "additionalProperties": false
+#   }},
+#   "placeholder_keys": ["field_name"]
+# }}
+
+# 규칙:
+# 1. 문서의 구조, 표, 스타일, 레이아웃은 최대한 유지하라.
+# 2. 예시 데이터(이름, 날짜, 금액, 부서명 등)는 문맥에 맞는 {{{{key}}}} 플레이스홀더로 치환하라.
+# 3. key 이름은 snake_case로 작성하라.
+# 4. html_template 안에 들어가는 플레이스홀더는 반드시 json_schema.properties에 존재해야 한다.
+# 5. placeholder_keys에는 html_template에 실제 사용된 key만 넣어라.
+# 6. json_schema는 이 문서 작성에 필요한 필드만 포함하라.
+# 7. required는 핵심 필드만 넣어라.
+# 8. 추가 설명 없이 JSON만 출력하라.
+# 9. 결재자 이름은 템플릿 본문에 실제로 표시되는 경우에만 placeholder와 schema에 포함하라. 메일 수신자 결정용 내부 필드는 임의로 추가하지 마라.
+
+# 템플릿 이름:
+# {template_name}
+# """
+
+#     response = client.responses.create(
+#         model="gpt-5.4",
+#         instructions=instructions,
+#         input=source_text,
+#     )
+
+#     data = _extract_json_from_text(response.output_text)
+
+#     # html_template = data.get("html_template", "").strip()
+#     # json_schema = data.get("json_schema", {})
+#     # placeholder_keys = data.get("placeholder_keys", [])
+
+#     # if not html_template:
+#     #     raise ValueError("html_template 생성에 실패했습니다.")
+
+#     # if not isinstance(json_schema, dict) or not json_schema:
+#     #     raise ValueError("json_schema 생성에 실패했습니다.")
+
+#     # if not isinstance(placeholder_keys, list):
+#     #     raise ValueError("placeholder_keys 형식이 올바르지 않습니다.")
+
+#     # return {
+#     #     "html_template": html_template,
+#     #     "json_schema": json_schema,
+#     #     "placeholder_keys": placeholder_keys,
+#     # }
+#     html_template = data.get("html_template", "").strip()
+#     json_schema = data.get("json_schema", {})
+#     placeholder_keys = data.get("placeholder_keys", [])
+
+#     if not html_template:
+#         raise ValueError("html_template 생성에 실패했습니다.")
+
+#     normalized = _normalize_template_schema(
+#         html_template=html_template,
+#         json_schema=json_schema,
+#         placeholder_keys=placeholder_keys,
+#     )
+
+#     return normalized    
+
+# PDF, HTML, DOCX, HWPX 형식의 결재서류에 {{key}} 형식의 플레이스홀더를 넣고 schema/fields를 생성하는 AI ---------------------------------------------------
 async def convert_template_to_schema(
     source_text: str,
     file_type: str,
     template_name: str,
+    confirmed_fields: list[dict] | None = None,
 ) -> dict:
+    confirmed_fields = confirmed_fields or []
+
+    if confirmed_fields:
+        confirmed_fields_text = json.dumps(
+            confirmed_fields,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        field_rule = f"""
+[사용자가 최종 확정한 자동 입력 항목]
+{confirmed_fields_text}
+
+중요:
+- 반드시 위 확정 항목만 사용하라.
+- html_template 안의 플레이스홀더 key는 위 확정 항목의 key만 사용하라.
+- 사용자가 삭제한 항목은 html_template, json_schema, placeholder_keys, fields에 포함하지 마라.
+- 사용자가 추가한 항목은 position_hint와 문서 문맥을 참고해 가장 자연스러운 위치에 {{{{key}}}} 형태로 반영하라.
+"""
+    else:
+        field_rule = """
+아직 사용자가 확정한 자동 입력 항목은 없다.
+문서 원문과 템플릿 이름을 보고 자동으로 채워야 할 항목 후보를 추천하라.
+"""
+
     instructions = f"""
 너는 회사 결재서류 템플릿 정규화 AI이다.
 
 입력 문서는 {file_type} 원문이다.
-이 문서를 재사용 가능한 HTML 템플릿과 JSON 스키마로 변환해야 한다.
+템플릿 이름은 "{template_name}"이다.
+DOCX/HWPX 입력의 경우 서버에서 추출한 텍스트와 표 구조가 원문으로 제공되므로, 줄바꿈과 | 기호로 구분된 표 행을 참고해 HTML 표 구조로 자연스럽게 재현하라.
+
+이 문서를 재사용 가능한 HTML 템플릿, JSON Schema, 사용자 검수용 자동 입력 항목 목록으로 변환해야 한다.
+
+{field_rule}
 
 반드시 아래 JSON 객체 형식으로만 응답하라.
 설명, 해설, 코드블록, 마크다운 없이 순수 JSON만 출력하라.
@@ -235,58 +546,63 @@ async def convert_template_to_schema(
   "json_schema": {{
     "type": "object",
     "properties": {{
-      "field_name": {{ "type": "string" }}
+      "field_name": {{
+        "type": "string",
+        "description": "필드 설명"
+      }}
     }},
     "required": ["field_name"],
     "additionalProperties": false
   }},
-  "placeholder_keys": ["field_name"]
+  "placeholder_keys": ["field_name"],
+  "fields": [
+    {{
+      "label": "화면에 표시할 항목명",
+      "key": "field_name",
+      "type": "string",
+      "required": true,
+      "description": "이 항목이 문서에서 의미하는 내용",
+      "position_hint": "문서 내에서 이 값이 들어가는 위치 설명"
+    }}
+  ]
 }}
 
 규칙:
-1. 문서의 구조, 표, 스타일, 레이아웃은 최대한 유지하라.
-2. 예시 데이터(이름, 날짜, 금액, 부서명 등)는 문맥에 맞는 {{{{key}}}} 플레이스홀더로 치환하라.
-3. key 이름은 snake_case로 작성하라.
-4. html_template 안에 들어가는 플레이스홀더는 반드시 json_schema.properties에 존재해야 한다.
-5. placeholder_keys에는 html_template에 실제 사용된 key만 넣어라.
-6. json_schema는 이 문서 작성에 필요한 필드만 포함하라.
-7. required는 핵심 필드만 넣어라.
-8. 추가 설명 없이 JSON만 출력하라.
-9. 결재자 이름은 템플릿 본문에 실제로 표시되는 경우에만 placeholder와 schema에 포함하라. 메일 수신자 결정용 내부 필드는 임의로 추가하지 마라.
-
-템플릿 이름:
-{template_name}
+1. 문서 종류는 template_name과 원문 내용을 함께 보고 판단하라.
+2. 문서의 제목, 섹션, 표 구조, 항목 순서는 최대한 유지하라.
+3. 원문 파일의 레이아웃, 문구, 표 구조, 줄바꿈, 항목명, 표시 순서, 제목 표현은 가능한 한 그대로 유지하라.
+4. 단순히 값을 입력해야 하는 부분만 {{{{key}}}} 플레이스홀더로 치환하고, 원문에 있는 고정 문구는 임의로 바꾸거나 요약하거나 재작성하지 마라.
+5. 원문에 존재하는 빈칸, 괄호, 서명란, 결재란, 표 셀 구조는 삭제하지 말고 HTML 안에 최대한 동일한 형태로 보존하라.
+6. 디자인을 새로 만들기보다 원문 문서의 시각적 구조를 HTML로 재현하는 것을 우선하라.
+7. HTML을 만들 때 원문에 없는 불필요한 섹션이나 항목을 만들지 마라.
+8. 사용자가 작성해야 하는 값은 {{{{key}}}} 형식의 플레이스홀더로 치환하라.
+9. key 이름은 영어 snake_case로 작성하라.
+10. html_template 안에 들어가는 placeholder key는 반드시 json_schema.properties와 placeholder_keys에 포함하라.
+11. placeholder_keys에는 html_template에 실제 사용된 key만 넣어라.
+12. fields 배열에는 사용자가 화면에서 확인할 자동 입력 항목만 넣어라.
+13. fields.label은 사용자가 이해하기 쉬운 한글 항목명으로 작성하라.
+14. fields.key는 json_schema.properties의 key와 정확히 일치해야 한다.
+15. fields.type은 string, text, date, number, amount, array, boolean 중 하나만 사용하라.
+16. json_schema.properties.type은 string, number, integer, boolean, array, object 중 하나만 사용하라.
+17. required는 문서 작성에 핵심적인 필드만 넣어라.
+18. 결재자 이름은 템플릿 본문에 실제로 표시되는 경우에만 placeholder와 schema에 포함하라.
+19. 메일 수신자 결정용 내부 필드는 임의로 추가하지 마라.
+20. JSON 외의 어떤 문장도 출력하지 마라.
 """
 
     response = client.responses.create(
         model="gpt-5.4",
+        # model="gpt-4.1",
         instructions=instructions,
         input=source_text,
     )
 
     data = _extract_json_from_text(response.output_text)
 
-    # html_template = data.get("html_template", "").strip()
-    # json_schema = data.get("json_schema", {})
-    # placeholder_keys = data.get("placeholder_keys", [])
-
-    # if not html_template:
-    #     raise ValueError("html_template 생성에 실패했습니다.")
-
-    # if not isinstance(json_schema, dict) or not json_schema:
-    #     raise ValueError("json_schema 생성에 실패했습니다.")
-
-    # if not isinstance(placeholder_keys, list):
-    #     raise ValueError("placeholder_keys 형식이 올바르지 않습니다.")
-
-    # return {
-    #     "html_template": html_template,
-    #     "json_schema": json_schema,
-    #     "placeholder_keys": placeholder_keys,
-    # }
     html_template = data.get("html_template", "").strip()
     json_schema = data.get("json_schema", {})
     placeholder_keys = data.get("placeholder_keys", [])
+    fields = data.get("fields", [])
 
     if not html_template:
         raise ValueError("html_template 생성에 실패했습니다.")
@@ -297,10 +613,57 @@ async def convert_template_to_schema(
         placeholder_keys=placeholder_keys,
     )
 
-    return normalized    
+    if confirmed_fields:
+        confirmed_schema, confirmed_keys, confirmed_normalized_fields = (
+            _build_schema_from_confirmed_fields(confirmed_fields)
+        )
+
+        html_keys = _extract_placeholder_keys_from_html(normalized["html_template"])
+
+        extra_keys = [key for key in html_keys if key not in confirmed_keys]
+        if extra_keys:
+            for key in extra_keys:
+                normalized["html_template"] = re.sub(
+                    r"\{\{\s*" + re.escape(key) + r"\s*\}\}",
+                    "",
+                    normalized["html_template"],
+                )
+
+        html_keys = _extract_placeholder_keys_from_html(normalized["html_template"])
+        missing_keys = [key for key in confirmed_keys if key not in html_keys]
+
+        if missing_keys:
+            raise ValueError(
+                "확정한 자동 입력 항목이 HTML 템플릿에 반영되지 않았습니다: "
+                + ", ".join(missing_keys)
+            )
+
+        confirmed_schema["properties"] = {
+            key: confirmed_schema["properties"][key]
+            for key in confirmed_keys
+            if key in confirmed_schema["properties"]
+        }
+
+        confirmed_schema["required"] = [
+            key for key in confirmed_schema.get("required", [])
+            if key in confirmed_schema["properties"]
+        ]
+
+        normalized["json_schema"] = confirmed_schema
+        normalized["placeholder_keys"] = confirmed_keys
+        normalized["fields"] = confirmed_normalized_fields
+
+    else:
+        normalized["fields"] = _normalize_template_fields(
+            fields=fields,
+            json_schema=normalized["json_schema"],
+            placeholder_keys=normalized["placeholder_keys"],
+        )
+
+    return normalized
     
 
-# 조직도를 읽고 json 데이터로 저장하는 AI
+# 조직도를 읽고 json 데이터로 저장하는 AI ------------------------------------------------------------------------------
 async def preview_org_members_from_image(
     image_b64: str,
     image_mime: str,
@@ -333,7 +696,8 @@ async def preview_org_members_from_image(
 """
 
     response = client.responses.create(
-        model="gpt-5.4",
+        # model="gpt-5.4",
+        model="gpt-4.1",
         instructions=instructions,
         input=[
             {
@@ -356,7 +720,7 @@ async def preview_org_members_from_image(
     rows = json.loads(raw)
     return _normalize_org_preview_rows(rows)
 
-# 결재 서류 규정을 읽고 결재 규칙 초안을 작성하는 AI
+# 결재 서류 규정을 읽고 결재 규칙 초안을 작성하는 AI --------------------------------------------------------------------------------------
 async def preview_approval_rules_from_guide(
     guide_text: str,
     templates: list[dict],
@@ -418,7 +782,8 @@ async def preview_approval_rules_from_guide(
 """
 
     response = client.responses.create(
-        model="gpt-5.4",
+        # model="gpt-5.4",
+        model="gpt-4.1",
         instructions=instructions,
         input="결재 처리 방침 초안을 JSON 배열로 생성하세요.",
     )
@@ -426,25 +791,145 @@ async def preview_approval_rules_from_guide(
     raw = _strip_code_fence(response.output_text)
     return json.loads(raw)
 
-# 결재 서류 자동 작성 AI
+# 결재 서류 자동 작성 AI -------------------------------------------------------------------------------------------------------
+# async def extract_expense_data(
+#     template_html: str,
+#     template_name: str,
+#     template_schema: dict,
+#     description: str,
+#     receipt_b64: str | None,
+#     receipt_mime: str | None,
+#     approval_rules: str,
+#     org_chart: dict,
+# ) -> dict:
+#     org_list = _build_org_list(org_chart)
+
+#     schema_text = json.dumps(template_schema, ensure_ascii=False, indent=2)
+
+#     instructions = f"""
+# 너는 회사 결재서류 자동 작성 AI이다.
+# 사용자가 선택한 템플릿 형식과 JSON Schema에 맞춰 문서 작성용 데이터를 추출하라.
+# 사용자의 자연어 설명, 영수증 이미지, 결재 규칙, 조직도를 함께 참고해야 한다.
+
+# === 선택된 템플릿 이름 ===
+# {template_name}
+
+# === 선택된 템플릿 HTML ===
+# {template_html}
+
+# === 이 템플릿의 JSON Schema ===
+# {schema_text}
+
+# === 결재 규칙 ===
+# {approval_rules}
+
+# === 조직도 ===
+# {org_list}
+
+# 반드시 위 JSON Schema를 만족하는 JSON 객체만 출력하라.
+# 설명, 해설, 코드블록, 마크다운 없이 JSON 객체만 출력하라.
+
+# 규칙:
+# 1. 반드시 JSON Schema의 properties에 정의된 필드만 사용하라.
+# 2. JSON Schema에 없는 필드는 절대 추가하지 마라.
+# 3. 템플릿 HTML 안의 placeholder 문맥을 참고해서 각 필드값을 자연스럽게 채워라.
+# 4. 영수증 이미지가 있으면 이미지의 정보와 자연어 설명을 함께 참고하되, 이미지 정보가 더 신뢰할 만하면 우선한다.
+# 5. 결재자 관련 필드는 템플릿 본문에 실제로 필요한 경우에만 채워라. 메일 수신자 결정은 서버가 별도로 처리하므로 결재자 추론에 과도하게 집착하지 마라.
+# 6. 숫자형 필드는 숫자로 반환하라. 쉼표, 원, 공백, 문자열 금지.
+# 7. 문자열 필드는 null 대신 가능한 범위에서 추정한 문자열을 넣어라.
+# 8. 날짜 필드는 템플릿 문맥에 맞는 형식으로 작성하라.
+# 9. JSON 외의 어떤 문장도 출력하지 않는다.
+# """
+
+#     user_content = []
+
+#     if receipt_b64 and receipt_mime:
+#         user_content.append(
+#             {
+#                 "type": "input_image",
+#                 "image_url": f"data:{receipt_mime};base64,{receipt_b64}",
+#             }
+#         )
+
+#     user_content.append(
+#         {
+#             "type": "input_text",
+#             "text": f"[사용자 자연어 설명]\n{description}",
+#         }
+#     )
+
+#     response = client.responses.create(
+#         model="gpt-5.4",
+#         instructions=instructions,
+#         input=[
+#             {
+#                 "role": "user",
+#                 "content": user_content,
+#             }
+#         ],
+#     )
+
+#     raw = _strip_code_fence(response.output_text)
+#     data = json.loads(raw)
+
+#     if not isinstance(data, dict):
+#         raise ValueError("AI 응답이 JSON 객체 형식이 아닙니다.")
+
+#     properties = template_schema.get("properties", {})
+#     normalized = {}
+
+#     for field_name, field_schema in properties.items():
+#         field_type = field_schema.get("type")
+#         value = data.get(field_name)
+
+#         if field_type == "integer":
+#             try:
+#                 normalized[field_name] = int(value or 0)
+#             except (TypeError, ValueError):
+#                 normalized[field_name] = 0
+
+#         elif field_type == "number":
+#             try:
+#                 normalized[field_name] = float(value or 0)
+#             except (TypeError, ValueError):
+#                 normalized[field_name] = 0
+
+#         elif field_type == "boolean":
+#             normalized[field_name] = bool(value)
+
+#         elif field_type == "array":
+#             normalized[field_name] = value if isinstance(value, list) else []
+
+#         elif field_type == "object":
+#             normalized[field_name] = value if isinstance(value, dict) else {}
+
+#         else:
+#             normalized[field_name] = "" if value is None else str(value).strip()
+
+#     return normalized
+
 async def extract_expense_data(
     template_html: str,
     template_name: str,
     template_schema: dict,
     description: str,
-    receipt_b64: str | None,
-    receipt_mime: str | None,
-    approval_rules: str,
-    org_chart: dict,
+    receipt_images: list[dict] | None = None,
+    approval_rules: str = "",
+    org_chart: dict | None = None,
 ) -> dict:
+    receipt_images = receipt_images or []
+    org_chart = org_chart or {}
+
     org_list = _build_org_list(org_chart)
 
     schema_text = json.dumps(template_schema, ensure_ascii=False, indent=2)
 
+    receipt_count = len(receipt_images)
+
     instructions = f"""
 너는 회사 결재서류 자동 작성 AI이다.
 사용자가 선택한 템플릿 형식과 JSON Schema에 맞춰 문서 작성용 데이터를 추출하라.
-사용자의 자연어 설명, 영수증 이미지, 결재 규칙, 조직도를 함께 참고해야 한다.
+사용자의 자연어 설명, 여러 장의 영수증 이미지, 결재 규칙, 조직도를 함께 참고해야 한다.
 
 === 선택된 템플릿 이름 ===
 {template_name}
@@ -461,6 +946,9 @@ async def extract_expense_data(
 === 조직도 ===
 {org_list}
 
+=== 첨부된 영수증 이미지 수 ===
+{receipt_count}개
+
 반드시 위 JSON Schema를 만족하는 JSON 객체만 출력하라.
 설명, 해설, 코드블록, 마크다운 없이 JSON 객체만 출력하라.
 
@@ -468,23 +956,19 @@ async def extract_expense_data(
 1. 반드시 JSON Schema의 properties에 정의된 필드만 사용하라.
 2. JSON Schema에 없는 필드는 절대 추가하지 마라.
 3. 템플릿 HTML 안의 placeholder 문맥을 참고해서 각 필드값을 자연스럽게 채워라.
-4. 영수증 이미지가 있으면 이미지의 정보와 자연어 설명을 함께 참고하되, 이미지 정보가 더 신뢰할 만하면 우선한다.
-5. 결재자 관련 필드는 템플릿 본문에 실제로 필요한 경우에만 채워라. 메일 수신자 결정은 서버가 별도로 처리하므로 결재자 추론에 과도하게 집착하지 마라.
-6. 숫자형 필드는 숫자로 반환하라. 쉼표, 원, 공백, 문자열 금지.
-7. 문자열 필드는 null 대신 가능한 범위에서 추정한 문자열을 넣어라.
-8. 날짜 필드는 템플릿 문맥에 맞는 형식으로 작성하라.
-9. JSON 외의 어떤 문장도 출력하지 않는다.
+4. 영수증 이미지가 여러 장 있으면 모든 이미지를 함께 확인하라.
+5. 여러 영수증에 금액, 품목, 날짜가 나누어져 있으면 문서 목적에 맞게 합산하거나 정리하라.
+6. 자연어 설명과 영수증 정보가 충돌하면 영수증 이미지의 실제 정보를 더 우선하라.
+7. 영수증 이미지가 일부 흐리거나 누락된 정보가 있으면 자연어 설명을 보조 근거로 사용하라.
+8. 결재자 관련 필드는 템플릿 본문에 실제로 필요한 경우에만 채워라. 메일 수신자 결정은 서버가 별도로 처리하므로 결재자 추론에 과도하게 집착하지 마라.
+9. 숫자형 필드는 숫자로 반환하라. 쉼표, 원, 공백, 문자열 금지.
+10. 문자열 필드는 null 대신 가능한 범위에서 추정한 문자열을 넣어라.
+11. 날짜 필드는 템플릿 문맥에 맞는 형식으로 작성하라.
+12. 배열 필드가 있으면 여러 영수증의 품목을 가능한 한 행 단위로 정리하라.
+13. JSON 외의 어떤 문장도 출력하지 않는다.
 """
 
     user_content = []
-
-    if receipt_b64 and receipt_mime:
-        user_content.append(
-            {
-                "type": "input_image",
-                "image_url": f"data:{receipt_mime};base64,{receipt_b64}",
-            }
-        )
 
     user_content.append(
         {
@@ -493,8 +977,31 @@ async def extract_expense_data(
         }
     )
 
+    for index, receipt in enumerate(receipt_images, start=1):
+        receipt_b64 = receipt.get("b64")
+        receipt_mime = receipt.get("mime") or "image/jpeg"
+        file_name = receipt.get("file_name") or f"receipt_{index}"
+
+        if not receipt_b64:
+            continue
+
+        user_content.append(
+            {
+                "type": "input_text",
+                "text": f"[영수증 이미지 {index}] 파일명: {file_name}",
+            }
+        )
+
+        user_content.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:{receipt_mime};base64,{receipt_b64}",
+            }
+        )
+
     response = client.responses.create(
-        model="gpt-5.4",
+        # model="gpt-5.4",
+        model="gpt-4.1",
         instructions=instructions,
         input=[
             {
@@ -530,7 +1037,7 @@ async def extract_expense_data(
                 normalized[field_name] = 0
 
         elif field_type == "boolean":
-            normalized[field_name] = bool(value)
+            normalized[field_name] = _to_bool(value)
 
         elif field_type == "array":
             normalized[field_name] = value if isinstance(value, list) else []
