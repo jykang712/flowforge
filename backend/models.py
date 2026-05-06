@@ -27,6 +27,8 @@ class DocumentTemplate(Base):
     # 추가
     template_schema = Column(Text, nullable=True)
     placeholder_keys = Column(Text, nullable=True)
+    
+    template_fields = Column(Text, nullable=True)
 
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -1,42 +1,3 @@
-// import { useRef, useState } from "react";
-
-// export default function DropZone({ label, accept, file, setFile, icon }) {
-//   const [drag, setDrag] = useState(false);
-//   const ref = useRef();
-
-//   const onDrop = (e) => {
-//     e.preventDefault();
-//     setDrag(false);
-//     const f = e.dataTransfer.files[0];
-//     if (f) setFile(f);
-//   };
-
-//   return (
-//     <div
-//       className={`drop-zone${drag ? " drag" : ""}`}
-//       onDragOver={(e) => {
-//         e.preventDefault();
-//         setDrag(true);
-//       }}
-//       onDragLeave={() => setDrag(false)}
-//       onDrop={onDrop}
-//       onClick={() => ref.current.click()}
-//     >
-//       <div className="icon">{icon}</div>
-//       <div>{label}</div>
-//       {file && <div className="file-name">📎 {file.name}</div>}
-
-//       <input
-//         ref={ref}
-//         type="file"
-//         accept={accept}
-//         style={{ display: "none" }}
-//         onChange={(e) => setFile(e.target.files[0])}
-//       />
-//     </div>
-//   );
-// }
-
 import { useRef, useState } from "react";
 
 function getFileExtension(fileName = "") {
@@ -86,7 +47,7 @@ function makeAcceptMessage(accept = "") {
 
 export default function DropZone({
   label,
-  accept,
+  accept = "",
   file,
   setFile,
   files,
@@ -96,7 +57,10 @@ export default function DropZone({
   imageOnly = false,
 }) {
   const [drag, setDrag] = useState(false);
-  const ref = useRef();
+  const ref = useRef(null);
+
+  const imageAccept = ".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp";
+  const inputAccept = imageOnly ? imageAccept : accept;
 
   const selectedFiles = multiple ? files || [] : file ? [file] : [];
 
@@ -108,18 +72,22 @@ export default function DropZone({
     let validFiles = newFiles;
 
     if (imageOnly) {
-      validFiles = newFiles.filter((item) => item.type.startsWith("image/"));
+      validFiles = newFiles.filter((item) =>
+        matchesAccept(item, imageAccept)
+      );
 
       if (validFiles.length !== newFiles.length) {
-        alert("영수증은 PNG, JPG, JPEG, WEBP 같은 이미지 파일만 업로드할 수 있습니다.");
+        alert("PNG, JPG, JPEG, WEBP 이미지 파일만 업로드할 수 있습니다.");
       }
 
       if (validFiles.length === 0) return;
-    } else if (accept) {
-      validFiles = newFiles.filter((item) => matchesAccept(item, accept));
+    } else if (inputAccept) {
+      validFiles = newFiles.filter((item) =>
+        matchesAccept(item, inputAccept)
+      );
 
       if (validFiles.length !== newFiles.length) {
-        alert(makeAcceptMessage(accept));
+        alert(makeAcceptMessage(inputAccept));
       }
 
       if (validFiles.length === 0) return;
@@ -163,7 +131,7 @@ export default function DropZone({
       }}
       onDragLeave={() => setDrag(false)}
       onDrop={onDrop}
-      onClick={() => ref.current.click()}
+      onClick={() => ref.current?.click()}
     >
       <div className="icon">{icon}</div>
       <div>{label}</div>
@@ -190,7 +158,7 @@ export default function DropZone({
       <input
         ref={ref}
         type="file"
-        accept={accept}
+        accept={inputAccept}
         multiple={multiple}
         style={{ display: "none" }}
         onChange={(e) => addFiles(e.target.files)}

@@ -6,6 +6,13 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 import html as html_lib
 from pypdf import PdfReader
+import os
+import shutil
+import subprocess
+import tempfile
+import mimetypes
+from pathlib import Path
+from bs4 import BeautifulSoup
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,9 +117,11 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 def match_approval_field_by_title(title: str) -> str | None:
     title = (title or "").strip()
 
-    # 대표이사는 '대표'와 '이사'가 같이 들어갈 수 있으므로 대표를 먼저 판단
-    if "대표" in title:
+    if "사장" in title or "대표" in title:
         return "approval_ceo_name"
+
+    if "담당임원" in title or "임원" in title:
+        return "approval_executive_name"
 
     if "이사" in title:
         return "approval_director_name"
@@ -120,8 +129,14 @@ def match_approval_field_by_title(title: str) -> str | None:
     if "부장" in title:
         return "approval_general_manager_name"
 
+    if "팀장" in title:
+        return "approval_team_leader_name"
+
     if "과장" in title:
         return "approval_manager_name"
+
+    if "담당" in title:
+        return "approval_staff_name"
 
     return None
 
@@ -284,49 +299,256 @@ def extract_hwpx_text(file_bytes: bytes) -> str:
 
     return _clean_extracted_text("\n".join(blocks))
 
+ALLOWED_TEMPLATE_SUFFIXES = {".docx"}
+BLOCKED_TEMPLATE_SUFFIXES = {".hwpx", ".hwp"}
+
+def _find_soffice_path() -> str | None:
+    candidates = [
+        os.getenv("SOFFICE_PATH"),
+        shutil.which("soffice"),
+        shutil.which("libreoffice"),
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+
+    for path in candidates:
+        if path and Path(path).exists():
+            return path
+
+    return None
+
+
+def _read_html_file(path: Path) -> str:
+    for encoding in ["utf-8", "cp949", "euc-kr"]:
+        try:
+            return path.read_text(encoding=encoding, errors="ignore")
+        except Exception:
+            continue
+
+    return path.read_text(errors="ignore")
+
+
+def _inline_local_images(html: str, base_dir: Path) -> str:
+    """
+    LibreOffice가 HTML 변환 시 이미지 파일을 별도로 만들 수 있으므로,
+    프론트 미리보기에서 깨지지 않도록 img src를 base64로 인라인 처리합니다.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not src:
+            continue
+
+        if src.startswith("data:") or src.startswith("http://") or src.startswith("https://"):
+            continue
+
+        image_path = (base_dir / src).resolve()
+
+        try:
+            if not image_path.exists():
+                continue
+
+            mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
+            image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+            img["src"] = f"data:{mime};base64,{image_b64}"
+        except Exception:
+            continue
+
+    return str(soup)
+
+def clean_converted_template_html(html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # LibreOffice가 만든 깨진 도형/이미지 제거
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        alt = (img.get("alt") or "").strip()
+        title = (img.get("title") or "").strip()
+        name_text = alt or title
+
+        if not src:
+            img.decompose()
+            continue
+
+        if name_text.startswith("모양") or name_text.startswith("도형"):
+            img.decompose()
+            continue
+
+        if src.startswith("file:"):
+            img.decompose()
+            continue
+
+        img["style"] = (
+            (img.get("style") or "")
+            + ";max-width:100%;height:auto;"
+        )
+
+    # placeholder가 표 칸을 밀어내지 않도록 기본 스타일 삽입
+    style_tag = soup.new_tag("style")
+    style_tag.string = """
+    table {
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    td, th {
+      box-sizing: border-box;
+      overflow: hidden;
+      vertical-align: middle;
+      word-break: break-word;
+    }
+
+    .template-placeholder {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+      font-size: 7px;
+      line-height: 1.1;
+      vertical-align: middle;
+      color: #1f4ed8;
+    }
+
+    p {
+      margin-top: 0;
+      margin-bottom: 0;
+    }
+    """
+
+    if soup.head:
+        soup.head.append(style_tag)
+    else:
+        soup.insert(0, style_tag)
+
+    return str(soup)
+
+def convert_office_file_to_html(file_bytes: bytes, filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+
+    if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "원본 서식 유지 HTML 변환은 DOCX 파일만 지원합니다. "
+                "HWPX 파일은 DOCX로 변환한 뒤 업로드해주세요."
+            ),
+        )
+
+    soffice_path = _find_soffice_path()
+
+    if not soffice_path:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "문서 변환 프로그램을 찾지 못했습니다. "
+                "LibreOffice를 설치하거나 .env에 SOFFICE_PATH를 설정해주세요."
+            ),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        input_path = tmp_dir / filename
+        output_dir = tmp_dir / "out"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path.write_bytes(file_bytes)
+
+        cmd = [
+            soffice_path,
+            "--headless",
+            "--convert-to",
+            "html",
+            "--outdir",
+            str(output_dir),
+            str(input_path),
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(
+                status_code=500,
+                detail="문서 HTML 변환 시간이 초과되었습니다.",
+            )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"문서 HTML 변환에 실패했습니다: {result.stderr or result.stdout}",
+            )
+
+        html_files = list(output_dir.glob("*.html")) + list(output_dir.glob("*.htm"))
+
+        if not html_files:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "HTML 변환 결과 파일을 찾지 못했습니다. "
+                    "HWPX 파일의 경우 변환 프로그램이 해당 형식을 지원하지 않을 수 있습니다."
+                ),
+            )
+
+        html = _read_html_file(html_files[0])
+        html = _inline_local_images(html, output_dir)
+        html = clean_converted_template_html(html)
+
+        if not html.strip():
+            raise HTTPException(
+                status_code=500,
+                detail="HTML 변환 결과가 비어 있습니다.",
+            )
+
+        return html
+
 
 async def read_template_source(template: UploadFile) -> tuple[str, str, str]:
     filename = template.filename or "template"
-    lowered = filename.lower()
+    suffix = Path(filename).suffix.lower()
 
-    if lowered.endswith(".html") or lowered.endswith(".htm"):
-        source_text = await extract_html_text(template)
-        file_type = "html"
-
-    elif lowered.endswith(".pdf"):
-        file_bytes = await template.read()
-        source_text = extract_pdf_text(file_bytes)
-        file_type = "pdf"
-
-    elif lowered.endswith(".docx"):
-        file_bytes = await template.read()
-        source_text = extract_docx_text(file_bytes)
-        file_type = "docx"
-
-    elif lowered.endswith(".hwpx"):
-        file_bytes = await template.read()
-        source_text = extract_hwpx_text(file_bytes)
-        file_type = "hwpx"
-
-    elif lowered.endswith(".hwp"):
+    if suffix in BLOCKED_TEMPLATE_SUFFIXES:
         raise HTTPException(
             status_code=400,
-            detail="HWP 파일은 바로 처리하기 어렵습니다. HWPX로 변환한 뒤 업로드해주세요.",
+            detail=(
+                "HWP/HWPX 파일은 현재 원본 서식 유지 HTML 변환이 안정적으로 지원되지 않습니다. "
+                "한컴오피스에서 DOCX 형식으로 저장한 뒤 다시 업로드해주세요."
+            ),
         )
 
-    else:
+    if suffix not in ALLOWED_TEMPLATE_SUFFIXES:
         raise HTTPException(
             status_code=400,
-            detail="HTML, PDF, DOCX, HWPX 파일만 업로드 가능합니다.",
+            detail="DOCX 파일만 업로드할 수 있습니다.",
         )
 
-    if not source_text.strip():
+    file_bytes = await template.read()
+
+    if not file_bytes:
         raise HTTPException(
             status_code=400,
-            detail="템플릿 원문을 읽지 못했습니다.",
+            detail="업로드된 파일이 비어 있습니다.",
         )
 
-    return filename, file_type, source_text
+    source_html = convert_office_file_to_html(
+        file_bytes=file_bytes,
+        filename=filename,
+    )
+
+    if not source_html.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="문서를 HTML로 변환하지 못했습니다.",
+        )
+
+    return filename, "html", source_html
 
 
 def parse_json_list_form(value: str, field_name: str) -> list:
@@ -388,6 +610,7 @@ def validate_template_conversion(
     html_template: str,
     json_schema: dict,
     placeholder_keys: list,
+    require_placeholders: bool = True,
 ):
     if not html_template or not html_template.strip():
         raise HTTPException(
@@ -395,7 +618,7 @@ def validate_template_conversion(
             detail="변환된 HTML 템플릿이 비어 있습니다."
         )
 
-    if "{{" not in html_template or "}}" not in html_template:
+    if require_placeholders and ("{{" not in html_template or "}}" not in html_template):
         raise HTTPException(
             status_code=500,
             detail="플레이스홀더 변환에 실패했습니다. 템플릿에 {{key}} 형식이 없습니다."
@@ -414,42 +637,44 @@ def validate_template_conversion(
         )
 
     properties = json_schema.get("properties")
-    if not isinstance(properties, dict) or not properties:
-        raise HTTPException(
-            status_code=500,
-            detail="템플릿 스키마 properties 생성에 실패했습니다."
-        )
 
-    if not isinstance(placeholder_keys, list) or not placeholder_keys:
-        raise HTTPException(
-            status_code=500,
-            detail="placeholder_keys 생성에 실패했습니다."
-        )
+    if require_placeholders:
+        if not isinstance(properties, dict) or not properties:
+            raise HTTPException(
+                status_code=500,
+                detail="템플릿 스키마 properties 생성에 실패했습니다."
+            )
 
-    found_keys = re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", html_template)
-    found_keys = list(dict.fromkeys(found_keys))
+        if not isinstance(placeholder_keys, list) or not placeholder_keys:
+            raise HTTPException(
+                status_code=500,
+                detail="placeholder_keys 생성에 실패했습니다."
+            )
 
-    if not found_keys:
-        raise HTTPException(
-            status_code=500,
-            detail="HTML 템플릿에서 플레이스홀더를 찾지 못했습니다."
-        )
+        found_keys = re.findall(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", html_template)
+        found_keys = list(dict.fromkeys(found_keys))
 
-    schema_keys = list(properties.keys())
+        if not found_keys:
+            raise HTTPException(
+                status_code=500,
+                detail="HTML 템플릿에서 플레이스홀더를 찾지 못했습니다."
+            )
 
-    missing_in_schema = [key for key in found_keys if key not in schema_keys]
-    if missing_in_schema:
-        raise HTTPException(
-            status_code=500,
-            detail=f"HTML의 placeholder 중 schema에 없는 key가 있습니다: {missing_in_schema}"
-        )
+        schema_keys = list(properties.keys())
 
-    missing_in_placeholder_keys = [key for key in found_keys if key not in placeholder_keys]
-    if missing_in_placeholder_keys:
-        raise HTTPException(
-            status_code=500,
-            detail=f"HTML의 placeholder 중 placeholder_keys에 없는 key가 있습니다: {missing_in_placeholder_keys}"
-        )
+        missing_in_schema = [key for key in found_keys if key not in schema_keys]
+        if missing_in_schema:
+            raise HTTPException(
+                status_code=500,
+                detail=f"HTML의 placeholder 중 schema에 없는 key가 있습니다: {missing_in_schema}"
+            )
+
+        missing_in_placeholder_keys = [key for key in found_keys if key not in placeholder_keys]
+        if missing_in_placeholder_keys:
+            raise HTTPException(
+                status_code=500,
+                detail=f"HTML의 placeholder 중 placeholder_keys에 없는 key가 있습니다: {missing_in_placeholder_keys}"
+            )
 
 def persist_approval_rule(
     db: Session,
@@ -652,6 +877,7 @@ async def preview_template_fields(
             source_text=source_text,
             file_type=file_type,
             template_name=template_name.strip(),
+            keep_cell_id=True,
         )
     except Exception as e:
         raise HTTPException(
@@ -668,6 +894,7 @@ async def preview_template_fields(
         html_template=html_template,
         json_schema=json_schema,
         placeholder_keys=placeholder_keys,
+        require_placeholders=bool(placeholder_keys),
     )
 
     return {
@@ -680,6 +907,8 @@ async def preview_template_fields(
         "json_schema": json_schema,
         "placeholder_keys": placeholder_keys,
         "fields": fields,
+        "analysis_mode": converted.get("analysis_mode", ""),
+        "support_level": converted.get("support_level", ""),
     }
 
 
@@ -690,6 +919,7 @@ async def save_template_with_fields(
     template_name: str = Form(...),
     description: str = Form(""),
     fields: str = Form("[]"),
+    html_template: str = Form(""),
     db: Session = Depends(get_db),
 ):
     confirmed_fields = parse_json_list_form(fields, "fields")
@@ -700,6 +930,13 @@ async def save_template_with_fields(
             detail="자동 입력 항목을 1개 이상 설정해주세요.",
         )
 
+    # filename = template.filename or "template"
+
+    # if html_template.strip():
+    #     source_text = html_template
+    #     file_type = "html"
+    # else:
+    #     filename, file_type, source_text = await read_template_source(template)
     filename, file_type, source_text = await read_template_source(template)
 
     try:
@@ -967,119 +1204,6 @@ def save_preview_org_members(
         "skipped": skipped,
     }
 
-# 결재 방침 저장/조회 수정 전--------------------------------------------------------------------------------------------------------
-# @app.post("/api/approval-rules")
-# def create_approval_rule(
-#     payload: dict,
-#     db: Session = Depends(get_db),
-# ):
-#     required = ["rule_name", "rule_text", "template_id", "approvers"]
-#     for field in required:
-#         if payload.get(field) in [None, ""]:
-#             raise HTTPException(status_code=400, detail=f"{field} 값이 필요합니다.")
-
-#     if not isinstance(payload["approvers"], list) or len(payload["approvers"]) == 0:
-#         raise HTTPException(status_code=400, detail="approvers는 1명 이상이어야 합니다.")
-
-#     template = (
-#         db.query(DocumentTemplate)
-#         .filter(
-#             DocumentTemplate.id == payload["template_id"],
-#             DocumentTemplate.is_active == True,
-#         )
-#         .first()
-#     )
-#     if not template:
-#         raise HTTPException(status_code=404, detail="적용할 템플릿을 찾을 수 없습니다.")
-
-#     rule = ApprovalRule(
-#         rule_name=payload["rule_name"].strip(),
-#         rule_text=payload["rule_text"].strip(),
-#         template_id=payload["template_id"],
-#         is_active=True,
-#     )
-#     db.add(rule)
-#     db.flush()  # rule.id 확보
-
-#     used_orders = set()
-
-#     for item in payload["approvers"]:
-#         member_id = item.get("approver_member_id")
-#         approval_order = item.get("approval_order", 1)
-#         approval_type = (item.get("approval_type") or "").strip() or None
-
-#         if not member_id:
-#             raise HTTPException(status_code=400, detail="결재자 ID가 필요합니다.")
-
-#         if approval_order in used_orders:
-#             raise HTTPException(status_code=400, detail="결재 순서는 중복될 수 없습니다.")
-#         used_orders.add(approval_order)
-
-#         approver = (
-#             db.query(OrgMember)
-#             .filter(
-#                 OrgMember.id == member_id,
-#                 OrgMember.is_active == True,
-#             )
-#             .first()
-#         )
-#         if not approver:
-#             raise HTTPException(status_code=404, detail=f"ID {member_id} 조직원을 찾을 수 없습니다.")
-
-#         db.add(
-#             ApprovalRuleApprover(
-#                 rule_id=rule.id,
-#                 approver_member_id=member_id,
-#                 approval_order=approval_order,
-#                 approval_type=approval_type,
-#             )
-#         )
-
-#     db.commit()
-#     db.refresh(rule)
-
-#     return {
-#         "status": "ok",
-#         "id": rule.id,
-#     }
-
-
-# @app.get("/api/approval-rules")
-# def get_approval_rules(db: Session = Depends(get_db)):
-#     rules = (
-#         db.query(ApprovalRule)
-#         .options(
-#             joinedload(ApprovalRule.template),
-#             joinedload(ApprovalRule.approver_maps).joinedload(ApprovalRuleApprover.approver)
-#         )
-#         .filter(ApprovalRule.is_active == True)
-#         .order_by(ApprovalRule.id.desc())
-#         .all()
-#     )
-
-#     return [
-#         {
-#             "id": r.id,
-#             "rule_name": r.rule_name,
-#             "rule_text": r.rule_text,
-#             "template_id": r.template_id,
-#             "template_name": r.template.template_name if r.template else "",
-#             "approvers": [
-#                 {
-#                     "id": m.id,
-#                     "approver_member_id": m.approver_member_id,
-#                     "approval_order": m.approval_order,
-#                     "approval_type": m.approval_type,
-#                     "approver_name": m.approver.name if m.approver else "",
-#                     "approver_title": m.approver.title if m.approver else "",
-#                     "approver_email": m.approver.email if m.approver else "",
-#                 }
-#                 for m in sorted(r.approver_maps, key=lambda x: x.approval_order)
-#             ],
-#         }
-#         for r in rules
-#     ]
-
 # 결재 방침 저장/조회--------------------------------------------------------------------------------------------------------
 @app.post("/api/approval-rules")
 def create_approval_rule(
@@ -1256,158 +1380,7 @@ def get_approval_rules(db: Session = Depends(get_db)):
         for r in rules
     ]
     
-# 문서 생성---------------------------------------------------------------------------------------------------------
-# @app.post("/api/process")
-# async def process_expense(
-#     template_id: int = Form(...),
-#     description: str = Form(...),
-#     receipt: UploadFile = File(None),
-#     db: Session = Depends(get_db),
-# ):
-#     template = (
-#         db.query(DocumentTemplate)
-#         .filter(
-#             DocumentTemplate.id == template_id,
-#             DocumentTemplate.is_active == True,
-#         )
-#         .first()
-#     )
-#     if not template:
-#         raise HTTPException(status_code=404, detail="선택한 템플릿을 찾을 수 없습니다.")
-
-#     rules = (
-#         db.query(ApprovalRule)
-#         .options(
-#             joinedload(ApprovalRule.approver_maps).joinedload(ApprovalRuleApprover.approver)
-#         )
-#         .filter(
-#             ApprovalRule.template_id == template_id,
-#             ApprovalRule.is_active == True,
-#         )
-#         .order_by(ApprovalRule.id.asc())
-#         .all()
-#     )
-
-#     if not rules:
-#         raise HTTPException(status_code=400, detail="해당 템플릿에 연결된 결재 방침이 없습니다.")
-
-#     org_chart = {}
-#     approval_rule_lines = []
-#     approval_line = []
-
-#     first_approver = None
-#     applied_rule = None
-#     recipient_member = None
-
-#     for rule in rules:
-#         approval_rule_lines.append(f"- {rule.rule_name}: {rule.rule_text}")
-
-#         sorted_maps = sorted(rule.approver_maps, key=lambda x: x.approval_order)
-
-#         for approver_map in sorted_maps:
-#             approver = approver_map.approver
-#             if approver:
-#                 org_chart[approver.name] = {
-#                     "title": approver.title,
-#                     "email": approver.email,
-#                     "approval_order": approver_map.approval_order,
-#                     "approval_type": approver_map.approval_type,
-#                 }
-
-#                 approval_line.append(
-#                     f"{approver_map.approval_order}차 {approver.name} ({approver.title})"
-#                 )
-
-#         # 첫 번째 규칙의 1차 결재자를 기본 수신자로 사용
-#         if not first_approver and sorted_maps:
-#             first_map = sorted_maps[0]
-#             if first_map.approver:
-#                 applied_rule = rule
-#                 first_approver = first_map.approver
-#                 recipient_member = first_map.approver
-
-#     approval_rule_text = "\n".join(approval_rule_lines)
-
-#     if not first_approver:
-#         raise HTTPException(status_code=400, detail="1차 결재자 정보를 찾을 수 없습니다.")
-
-#     receipt_b64 = None
-#     receipt_mime = None
-#     receipt_file_name = None
-#     receipt_content_type = None
-
-#     if receipt:
-#         receipt_bytes = await receipt.read()
-#         receipt_b64 = base64.b64encode(receipt_bytes).decode("utf-8")
-#         receipt_mime = receipt.content_type or "image/jpeg"
-#         receipt_file_name = receipt.filename
-#         receipt_content_type = receipt.content_type
-
-#     if not template.template_schema:
-#         raise HTTPException(status_code=400, detail="선택한 템플릿에 JSON Schema가 저장되어 있지 않습니다.")
-
-#     try:
-#         template_schema = json.loads(template.template_schema)
-#     except Exception:
-#         raise HTTPException(status_code=500, detail="템플릿의 JSON Schema 형식이 올바르지 않습니다.")
-
-#     expense_data = await extract_expense_data(
-#         template_html=template.html_content,
-#         template_name=template.template_name,
-#         template_schema=template_schema,
-#         description=description,
-#         receipt_b64=receipt_b64,
-#         receipt_mime=receipt_mime,
-#         approval_rules=approval_rule_text,
-#         org_chart=org_chart,
-#     )
-
-#     if not isinstance(expense_data, dict):
-#         raise HTTPException(status_code=500, detail="AI 응답 형식이 올바르지 않습니다.")
-
-#     # AI가 결재자를 잘못 내놔도 무시하고 DB 기준 1차 결재자로 덮어씀
-#     expense_data["approver_name"] = first_approver.name
-
-#     # 템플릿에서 결재선 전체를 쓸 수 있도록 보조 필드 추가
-#     expense_data["approval_line"] = ", ".join(approval_line)
-
-#     filled_html = fill_template(template.html_content, expense_data)
-
-#     recipient_name = first_approver.name
-#     recipient_title = first_approver.title
-#     recipient_email = first_approver.email
-
-#     saved_doc = GeneratedDocument(
-#         template_id=template.id,
-#         applied_rule_id=applied_rule.id if applied_rule else None,
-#         recipient_member_id=recipient_member.id if recipient_member else None,
-#         document_title=f"{template.template_name} 자동작성본",
-#         description=description,
-#         receipt_file_name=receipt_file_name,
-#         receipt_content_type=receipt_content_type,
-#         extracted_json=json.dumps(expense_data, ensure_ascii=False),
-#         html_content=filled_html,
-#         recipient_name=recipient_name,
-#         recipient_email=recipient_email,
-#         recipient_title=recipient_title,
-#         is_sent=False,
-#     )
-
-#     db.add(saved_doc)
-#     db.commit()
-#     db.refresh(saved_doc)
-
-#     return {
-#         "document_id": saved_doc.id,
-#         "expense_data": expense_data,
-#         "filled_html": filled_html,
-#         "recipient_name": recipient_name,
-#         "recipient_title": recipient_title,
-#         "recipient_email": recipient_email,
-#         "template_name": template.template_name,
-#         "file_name": template.file_name,
-#     }
-
+# 문서 생성 ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 @app.post("/api/process")
 async def process_expense(
     template_id: int = Form(...),
@@ -1451,6 +1424,9 @@ async def process_expense(
     approval_line = []
     
     approval_field_values = {
+        "approval_staff_name": "",
+        "approval_team_leader_name": "",
+        "approval_executive_name": "",
         "approval_manager_name": "",
         "approval_general_manager_name": "",
         "approval_director_name": "",
