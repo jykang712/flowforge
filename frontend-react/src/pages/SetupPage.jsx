@@ -81,11 +81,12 @@ function getFieldLocators(field = {}) {
   return result;
 }
 
-function makeCellLocator(cellId, locatorType = "cell") {
+function makeCellLocator(cellId, locatorType = "cell", options = {}) {
   return {
     type: "cell",
     cell_id: cellId,
     locator_type: locatorType,
+    ...options,
   };
 }
 
@@ -463,15 +464,38 @@ export default function SetupPage() {
       const cellId = cell.getAttribute("data-cell-id") || "";
       const locatorType = cell.getAttribute("data-locator-type") || "cell";
       const isFillable = cell.getAttribute("data-fillable") === "true";
+      const replaceOriginal = cell.getAttribute("data-replace-original") === "true";
       const hasPlaceholder = cell.textContent.includes("{{");
 
-      if (locatorType === "table_cell" && !isFillable && !hasPlaceholder) {
-        setAlert({
-          type: "info",
-          msg: "라벨/헤더 칸은 입력 위치로 선택할 수 없습니다. 실제 값을 입력할 빈칸을 선택해주세요.",
-        });
-        return;
-      }
+      // if (locatorType === "table_cell" && !isFillable && !hasPlaceholder) {
+      //   setAlert({
+      //     type: "info",
+      //     msg: "제목/라벨/헤더 칸은 입력 위치로 선택할 수 없습니다. 실제 값을 입력할 칸을 선택해주세요.",
+      //   });
+      //   return;
+      // }
+
+      // if (
+      //   locatorType === "table_cell" &&
+      //   cell.textContent.trim() &&
+      //   !replaceOriginal &&
+      //   !hasPlaceholder
+      // ) {
+      //   setAlert({
+      //     type: "info",
+      //     msg: "고정 문구가 있는 칸은 입력 위치로 선택할 수 없습니다. 빈칸 또는 입력 예시 문구가 있는 칸을 선택해주세요.",
+      //   });
+      //   return;
+      // }
+      const cellText = cell.textContent.trim();
+
+      const insertMode =
+        locatorType === "table_cell" &&
+        cellText &&
+        !replaceOriginal &&
+        !hasPlaceholder
+          ? "append"
+          : "replace";
 
       focusPreviewCell(cellId, false);
 
@@ -490,7 +514,14 @@ export default function SetupPage() {
       
           const nextLocators = alreadyLinked
             ? currentLocators.filter((item) => item.cell_id !== cellId)
-            : [...currentLocators, makeCellLocator(cellId, locatorType)];
+            // : [...currentLocators, makeCellLocator(cellId, locatorType)];
+            : [
+              ...currentLocators,
+              makeCellLocator(cellId, locatorType, {
+                insert_mode: insertMode,
+                manual: true,
+              }),
+            ];
       
           focusPreviewCells(nextCellIds, false);
       
@@ -510,9 +541,10 @@ export default function SetupPage() {
       
       setAlert({
         type: "success",
-        msg: `문서 위치가 ${cellId} ${
-          "추가 또는 해제"
-        }되었습니다. 같은 항목에 여러 위치를 연결할 수 있습니다.`,
+        msg:
+          insertMode === "append"
+            ? `문서 위치가 ${cellId}에 연결되었습니다. 기존 문구 뒤에 값이 입력됩니다.`
+            : `문서 위치가 ${cellId} 추가 또는 해제되었습니다. 같은 항목에 여러 위치를 연결할 수 있습니다.`,
       });
     };
 
@@ -633,7 +665,7 @@ export default function SetupPage() {
         templateName,
         description,
         fields: confirmedFields,
-        htmlTemplate: previewHtml,
+        // htmlTemplate: previewHtml,
       });
 
       setTemplateFile(null);

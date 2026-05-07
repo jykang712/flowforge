@@ -148,7 +148,7 @@ export async function saveTemplateWithFields({
   templateName,
   description = "",
   fields = [],
-  htmlTemplate = "",
+  // htmlTemplate = "",
 }) {
   const fd = new FormData();
 
@@ -170,7 +170,7 @@ export async function saveTemplateWithFields({
   fd.append("template_name", templateName.trim());
   fd.append("description", description);
   fd.append("fields", JSON.stringify(normalizedFields));
-  fd.append("html_template", htmlTemplate || "");
+  // fd.append("html_template", htmlTemplate || "");
 
   const res = await fetch(`${API}/api/templates/save-with-fields`, {
     method: "POST",
@@ -554,6 +554,66 @@ export async function sendExpenseEmail(result) {
   if (!res.ok) {
     const e = await res.json().catch(() => null);
     throw new Error(e?.detail || "발송 실패");
+  }
+
+  return res.json();
+}
+
+
+
+
+// 교육용 테스트 코드---------------------------------------------------------------------------------------------------------------------------
+
+
+
+// -----------------------------
+// 교육용 1회성 문서 자동 작성
+// DB 저장 없이, 1차 분석 결과 + 자연어 + 이미지로 바로 작성
+// -----------------------------
+export async function generateEducationDocumentOnce({
+  templateName,
+  htmlTemplate,
+  fields = [],
+  description,
+  receiptFiles = [],
+}) {
+  if (!templateName?.trim()) {
+    throw new Error("양식 이름이 필요합니다.");
+  }
+
+  if (!htmlTemplate?.trim()) {
+    throw new Error("먼저 AI 양식 분석을 진행해주세요.");
+  }
+
+  if (!Array.isArray(fields) || fields.length === 0) {
+    throw new Error("자동 입력 항목이 필요합니다.");
+  }
+
+  if (!description?.trim()) {
+    throw new Error("문서 작성에 필요한 자연어 설명을 입력해주세요.");
+  }
+
+  const fd = new FormData();
+
+  const normalizedFields = fields.map(normalizeTemplateFieldForSubmit);
+
+  fd.append("template_name", templateName.trim());
+  fd.append("html_template", htmlTemplate);
+  fd.append("fields", JSON.stringify(normalizedFields));
+  fd.append("description", description.trim());
+
+  receiptFiles.forEach((file) => {
+    fd.append("receipts", file);
+  });
+
+  const res = await fetch(`${API}/api/education/generate-once`, {
+    method: "POST",
+    body: fd,
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "교육용 문서 자동 작성 실패");
   }
 
   return res.json();

@@ -41,6 +41,7 @@ from claude_service import (
     preview_org_members_from_image,
     preview_approval_rules_from_guide,
     convert_template_to_schema,
+    generate_document_once as claude_generate_document_once,     # 교육용 테스트 코드
 )
 # ---------------------------------------------------------------------------------------------
 from email_service import send_document_email
@@ -930,13 +931,6 @@ async def save_template_with_fields(
             detail="자동 입력 항목을 1개 이상 설정해주세요.",
         )
 
-    # filename = template.filename or "template"
-
-    # if html_template.strip():
-    #     source_text = html_template
-    #     file_type = "html"
-    # else:
-    #     filename, file_type, source_text = await read_template_source(template)
     filename, file_type, source_text = await read_template_source(template)
 
     try:
@@ -1379,6 +1373,118 @@ def get_approval_rules(db: Session = Depends(get_db)):
         }
         for r in rules
     ]
+    
+
+
+
+# 교육용 테스트 코드---------------------------------------------------------------------------------------------------------------------------
+# 교육용 1회성 문서 자동 작성
+# DB 저장 없이 1차 분석 결과 + 자연어 설명 + 이미지로 바로 문서를 작성한다.
+@app.post("/api/education/generate-once")
+async def generate_education_document_once(
+    template_name: str = Form(...),
+    html_template: str = Form(...),
+    fields: str = Form("[]"),
+    description: str = Form(...),
+    receipts: list[UploadFile] = File(default=[]),
+):
+    confirmed_fields = parse_json_list_form(fields, "fields")
+
+    if not template_name.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="양식 이름이 필요합니다.",
+        )
+
+    if not html_template.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="분석된 HTML 양식이 없습니다. 먼저 양식 분석을 진행해주세요.",
+        )
+
+    if not confirmed_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="자동 입력 항목을 1개 이상 확인해주세요.",
+        )
+
+    if not description.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="문서 작성에 필요한 자연어 설명을 입력해주세요.",
+        )
+
+    receipt_images = []
+
+    for receipt in receipts:
+        if not receipt:
+            continue
+
+        content_type = receipt.content_type or ""
+
+        if not content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"지원하지 않는 파일 형식입니다: {receipt.filename}. JPG, PNG, WEBP 등 이미지 파일만 업로드해주세요.",
+            )
+
+        receipt_bytes = await receipt.read()
+
+        if not receipt_bytes:
+            continue
+
+        receipt_images.append(
+            {
+                "b64": base64.b64encode(receipt_bytes).decode("utf-8"),
+                "mime": content_type,
+                "file_name": receipt.filename,
+                "content_type": content_type,
+            }
+        )
+
+    try:
+        generated = await claude_generate_document_once(
+            html_template=html_template,
+            template_name=template_name.strip(),
+            confirmed_fields=confirmed_fields,
+            description=description.strip(),
+            receipt_images=receipt_images,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"교육용 문서 자동 작성 중 오류가 발생했습니다: {str(e)}",
+        )
+
+    expense_data = generated["expense_data"]
+    filled_html = fill_template(generated["html_template"], expense_data)
+
+    return {
+        "status": "ok",
+        "template_name": template_name.strip(),
+        "expense_data": expense_data,
+        "filled_html": filled_html,
+        "html_template": generated["html_template"],
+        "json_schema": generated["json_schema"],
+        "placeholder_keys": generated["placeholder_keys"],
+        "fields": generated["fields"],
+    }
+# 교육용 테스트 코드---------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     
 # 문서 생성 ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 @app.post("/api/process")

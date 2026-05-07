@@ -11,6 +11,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.mysql import LONGTEXT
 
 from database import Base
 
@@ -21,14 +22,14 @@ class DocumentTemplate(Base):
     id = Column(Integer, primary_key=True, index=True)
     template_name = Column(String(255), nullable=False)
     file_name = Column(String(255), nullable=False)
-    html_content = Column(Text, nullable=False)
+    html_content = Column(LONGTEXT, nullable=False)
     description = Column(Text, nullable=True)
 
     # 추가
-    template_schema = Column(Text, nullable=True)
-    placeholder_keys = Column(Text, nullable=True)
+    template_schema = Column(LONGTEXT, nullable=True)
+    placeholder_keys = Column(LONGTEXT, nullable=True)
     
-    template_fields = Column(Text, nullable=True)
+    template_fields = Column(LONGTEXT, nullable=True)
 
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -120,8 +121,8 @@ class GeneratedDocument(Base):
     receipt_file_name = Column(String(255), nullable=True)
     receipt_content_type = Column(String(100), nullable=True)
 
-    extracted_json = Column(Text, nullable=True)
-    html_content = Column(Text, nullable=False)
+    extracted_json = Column(LONGTEXT, nullable=True)
+    html_content = Column(LONGTEXT, nullable=False)
 
     recipient_name = Column(String(100), nullable=True)
     recipient_email = Column(String(255), nullable=True)

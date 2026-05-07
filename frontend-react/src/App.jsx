@@ -3,6 +3,8 @@ import SetupPage from "./pages/SetupPage";
 import OrgPage from "./pages/OrgPage";
 import RulePage from "./pages/RulePage";
 import ProcessPage from "./pages/ProcessPage";
+{/* 교육용 테스트 코드 */}
+import EducationPage from "./pages/education";
 import "./styles/style.css";
 
 export default function App() {
@@ -46,6 +48,15 @@ export default function App() {
           <span className="nav-dot" />
           결재서류 작성
         </div>
+
+        {/* 교육용 테스트 코드 */}
+        <div
+          className={`nav-item${page === "education" ? " active" : ""}`}
+          onClick={() => setPage("education")}
+        >
+          <span className="nav-dot" />
+          교육용 MVP
+        </div>
       </div>
 
       <div className="main">
@@ -53,6 +64,8 @@ export default function App() {
         {page === "org" && <OrgPage />}
         {page === "rule" && <RulePage />}
         {page === "process" && <ProcessPage />}
+        {/* 교육용 테스트 코드 */}
+        {page === "education" && <EducationPage />}
       </div>
     </div>
   );

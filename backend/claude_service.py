@@ -1501,21 +1501,31 @@ def _inject_placeholders_by_locator(
 
             target_locator_type = (
                 locator.get("locator_type")
-                or locator.get("type")
                 or target.get("data-locator-type")
+                or locator.get("type")
                 or ""
             )
-
+            
+            target_actual_type = target.get("data-locator-type") or target_locator_type
+            
             target_text = _normalize_korean_label(target.get_text(" ", strip=True))
             is_fillable = target.get("data-fillable") == "true"
             replace_original = target.get("data-replace-original") == "true"
+            insert_mode = _clean_text(locator.get("insert_mode"))
+            
+            # 사용자가 직접 위치 선택한 텍스트 셀은 기존 문구를 지우지 않고 뒤에 placeholder를 붙임
+            if target_actual_type == "table_cell" and insert_mode == "append":
+                target.append(" ")
+                target.append(_make_placeholder_span(soup, key))
+                continue
 
-            if target_locator_type == "table_cell":
+            # 실제 HTML target이 table_cell이면 locator 정보와 상관없이 무조건 표 셀 보호 로직 적용
+            if target_actual_type == "table_cell":
                 if not is_fillable:
                     continue
 
-                # 라벨/헤더 칸은 원본 유지
-                # 단, replace_original=true인 입력 예시 문구나 "/" 결재칸은 교체 가능
+                # 제목, 라벨, 헤더처럼 텍스트가 있는 셀은 원본 유지
+                # 단, 20년 월일~ 같은 입력 예시 문구나 "/" 결재칸만 교체 허용
                 if target_text and not replace_original:
                     continue
 
@@ -1524,6 +1534,18 @@ def _inject_placeholders_by_locator(
                 target.append(" ")
                 target.append(_make_placeholder_span(soup, key))
                 continue
+            
+            # 최종 안전장치: table_cell인데 입력 가능 칸이 아니면 절대 원본 텍스트를 지우지 않음
+            if target.get("data-locator-type") == "table_cell":
+                final_text = _normalize_korean_label(target.get_text(" ", strip=True))
+                final_is_fillable = target.get("data-fillable") == "true"
+                final_replace_original = target.get("data-replace-original") == "true"
+
+                if not final_is_fillable:
+                    continue
+
+                if final_text and not final_replace_original:
+                    continue
 
             target.clear()
 
@@ -2136,3 +2158,62 @@ async def extract_expense_data(
             normalized[field_name] = "" if value is None else str(value).strip()
 
     return normalized
+
+
+
+
+
+
+
+
+# 교육용 테스트 코드----------------------------------------------------------------------------------------------------------------------------
+
+
+# 교육용 1회성 자동 작성
+# 1차 분석 결과(html_template + confirmed_fields)를 받아
+# DB 저장 없이 문서 작성용 데이터만 생성한다.
+async def generate_document_once(
+    html_template: str,
+    template_name: str,
+    confirmed_fields: list[dict],
+    description: str,
+    receipt_images: list[dict] | None = None,
+) -> dict:
+    receipt_images = receipt_images or []
+
+    if not html_template or not html_template.strip():
+        raise ValueError("html_template 값이 비어 있습니다.")
+
+    if not confirmed_fields:
+        raise ValueError("confirmed_fields 값이 비어 있습니다.")
+
+    # confirmed_fields가 있으므로 양식 분석 AI를 다시 호출하지 않고,
+    # 확정된 항목 기준으로 placeholder와 JSON Schema를 재구성한다.
+    converted = await convert_template_to_schema(
+        source_text=html_template,
+        file_type="html",
+        template_name=template_name,
+        confirmed_fields=confirmed_fields,
+        keep_cell_id=False,
+    )
+
+    clean_html_template = converted["html_template"]
+    template_schema = converted["json_schema"]
+
+    expense_data = await extract_expense_data(
+        template_html=clean_html_template,
+        template_name=template_name,
+        template_schema=template_schema,
+        description=description,
+        receipt_images=receipt_images,
+        approval_rules="",
+        org_chart={},
+    )
+
+    return {
+        "html_template": clean_html_template,
+        "json_schema": template_schema,
+        "placeholder_keys": converted.get("placeholder_keys", []),
+        "fields": converted.get("fields", []),
+        "expense_data": expense_data,
+    }
