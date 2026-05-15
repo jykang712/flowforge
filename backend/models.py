@@ -128,7 +128,16 @@ class GeneratedDocument(Base):
     recipient_email = Column(String(255), nullable=True)
     recipient_title = Column(String(100), nullable=True)
 
+    # 작성자 정보 (extracted_json에서 추출 또는 별도 저장)
+    requester_name = Column(String(100), nullable=True)
+    requester_department = Column(String(100), nullable=True)
+
+    # 결재라인 (텍스트 + JSON)
+    approval_line_text = Column(Text, nullable=True)
+    approval_line_json = Column(LONGTEXT, nullable=True)
+
     is_sent = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

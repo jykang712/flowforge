@@ -3,6 +3,7 @@ import SetupPage from "./pages/SetupPage";
 import OrgPage from "./pages/OrgPage";
 import RulePage from "./pages/RulePage";
 import ProcessPage from "./pages/ProcessPage";
+import ManagePage from "./pages/ManagePage";
 {/* 교육용 테스트 코드 */}
 import EducationPage from "./pages/education";
 import "./styles/style.css";
@@ -49,6 +50,14 @@ export default function App() {
           결재서류 작성
         </div>
 
+        <div
+          className={`nav-item${page === "manage" ? " active" : ""}`}
+          onClick={() => setPage("manage")}
+        >
+          <span className="nav-dot" />
+          자동작성 문서 관리
+        </div>
+
         {/* 교육용 테스트 코드 */}
         <div
           className={`nav-item${page === "education" ? " active" : ""}`}
@@ -64,6 +73,7 @@ export default function App() {
         {page === "org" && <OrgPage />}
         {page === "rule" && <RulePage />}
         {page === "process" && <ProcessPage />}
+        {page === "manage" && <ManagePage />}
         {/* 교육용 테스트 코드 */}
         {page === "education" && <EducationPage />}
       </div>

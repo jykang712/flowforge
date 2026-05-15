@@ -48,9 +48,15 @@ from email_service import send_document_email
 
 app = FastAPI()
 
+_cors_env = os.getenv("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1671,6 +1677,43 @@ async def process_expense(
     recipient_title = first_approver.title
     recipient_email = first_approver.email
 
+    # ── 작성자 정보 추출 (우선순위 순) ────────────────────────────────────
+    requester_name = (
+        expense_data.get("requester")
+        or expense_data.get("employee_name")
+        or expense_data.get("draft_person")
+        or expense_data.get("name")
+        or ""
+    )
+    requester_department = (
+        expense_data.get("department")
+        or expense_data.get("draft_department")
+        or expense_data.get("employee_department")
+        or ""
+    )
+
+    # ── 결재라인 텍스트/JSON 생성 (applied_rule 기준) ─────────────────────
+    approval_line_text = ""
+    approval_line_json_list = []
+
+    if applied_rule:
+        sorted_maps = sorted(applied_rule.approver_maps, key=lambda x: x.approval_order)
+        line_parts = []
+        for m in sorted_maps:
+            ap = m.approver
+            if ap:
+                part = f"{m.approval_order}차 {ap.name}({ap.title}, {m.approval_type or '결재'})"
+                line_parts.append(part)
+                approval_line_json_list.append({
+                    "approval_order": m.approval_order,
+                    "approval_type": m.approval_type or "결재",
+                    "approver_member_id": ap.id,
+                    "approver_name": ap.name,
+                    "approver_title": ap.title,
+                    "approver_email": ap.email or "",
+                })
+        approval_line_text = " → ".join(line_parts)
+
     saved_doc = GeneratedDocument(
         template_id=template.id,
         applied_rule_id=applied_rule.id if applied_rule else None,
@@ -1684,7 +1727,12 @@ async def process_expense(
         recipient_name=recipient_name,
         recipient_email=recipient_email,
         recipient_title=recipient_title,
+        requester_name=requester_name,
+        requester_department=requester_department,
+        approval_line_text=approval_line_text,
+        approval_line_json=json.dumps(approval_line_json_list, ensure_ascii=False),
         is_sent=False,
+        is_active=True,
     )
 
     db.add(saved_doc)
@@ -1698,6 +1746,10 @@ async def process_expense(
         "recipient_name": recipient_name,
         "recipient_title": recipient_title,
         "recipient_email": recipient_email,
+        "requester_name": requester_name,
+        "requester_department": requester_department,
+        "approval_line_text": approval_line_text,
+        "approval_line": approval_line_json_list,
         "template_name": template.template_name,
         "file_name": template.file_name,
     }
@@ -1739,3 +1791,144 @@ async def send_email(payload: dict, db: Session = Depends(get_db)):
             db.commit()
 
     return result
+
+
+# ── 자동작성 문서 관리 API ─────────────────────────────────────────────────────
+
+@app.get("/api/generated-documents")
+def get_generated_documents(db: Session = Depends(get_db)):
+    """자동작성 완료 문서 목록 조회 (최신순, is_active=True만)"""
+    docs = (
+        db.query(GeneratedDocument)
+        .options(joinedload(GeneratedDocument.template))
+        .filter(GeneratedDocument.is_active == True)
+        .order_by(GeneratedDocument.created_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": doc.id,
+            "document_title": doc.document_title or "",
+            "template_id": doc.template_id,
+            "template_name": doc.template.template_name if doc.template else "",
+            "file_name": doc.template.file_name if doc.template else "",
+            "requester_name": doc.requester_name or "",
+            "requester_department": doc.requester_department or "",
+            "recipient_name": doc.recipient_name or "",
+            "recipient_title": doc.recipient_title or "",
+            "recipient_email": doc.recipient_email or "",
+            "approval_line_text": doc.approval_line_text or "",
+            "is_sent": doc.is_sent,
+            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        }
+        for doc in docs
+    ]
+
+
+@app.get("/api/generated-documents/{document_id}")
+def get_generated_document_detail(
+    document_id: int,
+    db: Session = Depends(get_db),
+):
+    """자동작성 문서 상세 조회"""
+    doc = (
+        db.query(GeneratedDocument)
+        .options(joinedload(GeneratedDocument.template))
+        .filter(GeneratedDocument.id == document_id)
+        .first()
+    )
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+
+    try:
+        extracted_json = json.loads(doc.extracted_json) if doc.extracted_json else {}
+    except Exception:
+        extracted_json = {}
+
+    try:
+        approval_line = json.loads(doc.approval_line_json) if doc.approval_line_json else []
+    except Exception:
+        approval_line = []
+
+    return {
+        "id": doc.id,
+        "document_title": doc.document_title or "",
+        "template_id": doc.template_id,
+        "template_name": doc.template.template_name if doc.template else "",
+        "file_name": doc.template.file_name if doc.template else "",
+        "description": doc.description or "",
+        "receipt_file_name": doc.receipt_file_name or "",
+        "receipt_content_type": doc.receipt_content_type or "",
+        "extracted_json": extracted_json,
+        "html_content": doc.html_content or "",
+        "requester_name": doc.requester_name or "",
+        "requester_department": doc.requester_department or "",
+        "recipient_name": doc.recipient_name or "",
+        "recipient_title": doc.recipient_title or "",
+        "recipient_email": doc.recipient_email or "",
+        "approval_line_text": doc.approval_line_text or "",
+        "approval_line": approval_line,
+        "is_sent": doc.is_sent,
+        "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+    }
+
+
+@app.patch("/api/generated-documents/{document_id}")
+def update_generated_document(
+    document_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    """편집된 HTML 저장 또는 문서 상태 수정"""
+    doc = (
+        db.query(GeneratedDocument)
+        .filter(GeneratedDocument.id == document_id)
+        .first()
+    )
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+
+    if payload.get("html_content"):
+        doc.html_content = payload["html_content"]
+
+    if payload.get("document_title"):
+        doc.document_title = payload["document_title"]
+
+    if "is_sent" in payload and isinstance(payload["is_sent"], bool):
+        doc.is_sent = payload["is_sent"]
+
+    if "extracted_json" in payload and payload["extracted_json"] is not None:
+        raw = payload["extracted_json"]
+        if isinstance(raw, dict):
+            doc.extracted_json = json.dumps(raw, ensure_ascii=False)
+        elif isinstance(raw, str):
+            doc.extracted_json = raw
+
+    db.commit()
+
+    return {"status": "ok", "document_id": document_id}
+
+
+@app.delete("/api/generated-documents/{document_id}")
+def delete_generated_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+):
+    """문서 비활성화 (is_active=False)"""
+    doc = (
+        db.query(GeneratedDocument)
+        .filter(GeneratedDocument.id == document_id)
+        .first()
+    )
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+
+    doc.is_active = False
+    db.commit()
+
+    return {"status": "ok"}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Expense Auto FastAPI Backend
+After=network.target mariadb.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/expense-auto/backend
+ExecStart=/home/ubuntu/expense-auto/backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -4,3 +4,6 @@ anthropic
 python-multipart
 python-dotenv
 beautifulsoup4
+sqlalchemy
+mariadb
+pypdf

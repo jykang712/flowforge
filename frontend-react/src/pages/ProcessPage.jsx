@@ -1,7 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import DropZone from "../components/DropZone";
-import { getTemplates, processExpense, sendExpenseEmail } from "../services/api";
+import EditableHtmlPreview from "../components/EditableHtmlPreview";
+import {
+  getTemplates,
+  getTemplateDetail,
+  processExpense,
+  sendExpenseEmail,
+  updateGeneratedDocument,
+} from "../services/api";
 
+// ─── 레이블 한글 매핑 ───────────────────────────────────────────────────────
 const LABEL_MAP = {
   expense_date: "지출일",
   request_date: "문서일자",
@@ -26,16 +34,9 @@ function getDisplayLabel(key) {
 
 function isAmountKey(key) {
   const lowered = String(key).toLowerCase();
-  return [
-    "amount",
-    "price",
-    "cost",
-    "total",
-    "supply",
-    "vat",
-    "fee",
-    "budget",
-  ].some((word) => lowered.includes(word));
+  return ["amount", "price", "cost", "total", "supply", "vat", "fee", "budget"].some(
+    (word) => lowered.includes(word)
+  );
 }
 
 function isDateKey(key) {
@@ -46,37 +47,22 @@ function isDateKey(key) {
 function formatDateValue(value) {
   if (!value) return "-";
   const str = String(value).trim();
-
   if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
     const [y, m, d] = str.split("-");
     return `${y}.${m}.${d}`;
   }
-
   return str;
 }
 
 function formatPrimitiveValue(key, value) {
-  if (value === null || value === undefined || value === "") {
-    return "-";
-  }
-
+  if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "number") {
-    if (isAmountKey(key)) {
-      return `${value.toLocaleString()}원`;
-    }
+    if (isAmountKey(key)) return `${value.toLocaleString()}원`;
     return value.toLocaleString();
   }
-
-  if (typeof value === "boolean") {
-    return value ? "예" : "아니오";
-  }
-
+  if (typeof value === "boolean") return value ? "예" : "아니오";
   const str = String(value).trim();
-
-  if (isDateKey(key)) {
-    return formatDateValue(str);
-  }
-
+  if (isDateKey(key)) return formatDateValue(str);
   return str || "-";
 }
 
@@ -84,12 +70,8 @@ function renderValue(key, value) {
   if (value === null || value === undefined || value === "") {
     return <span className="result-value">-</span>;
   }
-
   if (Array.isArray(value)) {
-    if (value.length === 0) {
-      return <span className="result-value">-</span>;
-    }
-
+    if (value.length === 0) return <span className="result-value">-</span>;
     return (
       <div className="result-value" style={{ textAlign: "left", width: "100%" }}>
         {value.map((item, idx) => (
@@ -102,13 +84,9 @@ function renderValue(key, value) {
       </div>
     );
   }
-
   if (typeof value === "object") {
     const entries = Object.entries(value);
-    if (entries.length === 0) {
-      return <span className="result-value">-</span>;
-    }
-
+    if (entries.length === 0) return <span className="result-value">-</span>;
     return (
       <div className="result-value" style={{ textAlign: "left", width: "100%" }}>
         {entries.map(([childKey, childValue]) => (
@@ -120,27 +98,34 @@ function renderValue(key, value) {
       </div>
     );
   }
-
   return <span className="result-value">{formatPrimitiveValue(key, value)}</span>;
 }
 
+// ─── 메인 컴포넌트 ───────────────────────────────────────────────────────────
 export default function ProcessPage() {
   const [templates, setTemplates] = useState([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState("");
   const [desc, setDesc] = useState("");
-  // const [receiptFile, setReceiptFile] = useState(null);
   const [receiptFiles, setReceiptFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [sending, setSending] = useState(false);
   const [alert, setAlert] = useState(null);
+  const [selectedTemplatePreview, setSelectedTemplatePreview] = useState(null);
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
+  // ── 편집 관련 상태 ──────────────────────────────────────────────────────
+  const [editedHtml, setEditedHtml] = useState("");
+  const [editMode, setEditMode] = useState(false);
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  // ── 템플릿 목록 로드 ────────────────────────────────────────────────────
   useEffect(() => {
     const loadTemplates = async () => {
       try {
         const data = await getTemplates();
         setTemplates(data);
-
         if (data.length > 0) {
           setSelectedTemplateId(String(data[0].id));
         }
@@ -148,21 +133,15 @@ export default function ProcessPage() {
         setAlert({ type: "error", msg: e.message || "템플릿 목록 조회 실패" });
       }
     };
-
     loadTemplates();
   }, []);
 
-  const safeHtml = useMemo(() => {
-    if (!result?.filled_html) return "";
-    return result.filled_html.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "");
-  }, [result]);
-
+  // ── 자동 작성 실행 ──────────────────────────────────────────────────────
   const process = async () => {
     if (!desc.trim()) {
       setAlert({ type: "error", msg: "설명을 입력해주세요." });
       return;
     }
-
     if (!selectedTemplateId) {
       setAlert({ type: "error", msg: "템플릿을 먼저 선택해주세요." });
       return;
@@ -170,16 +149,18 @@ export default function ProcessPage() {
 
     setLoading(true);
     setResult(null);
+    setEditedHtml("");
+    setEditMode(false);
     setAlert(null);
 
     try {
       const data = await processExpense({
         templateId: selectedTemplateId,
         desc,
-        // receiptFile,
         receiptFiles,
       });
       setResult(data);
+      setEditedHtml(data.filled_html || "");
     } catch (e) {
       setAlert({ type: "error", msg: e.message || "문서 생성 실패" });
     } finally {
@@ -187,14 +168,52 @@ export default function ProcessPage() {
     }
   };
 
+  // ── 템플릿 미리보기 ─────────────────────────────────────────────────────
+  const openTemplatePreview = async (templateId) => {
+    if (!templateId) {
+      setAlert({ type: "error", msg: "미리보기할 템플릿을 먼저 선택해주세요." });
+      return;
+    }
+    setPreviewLoading(true);
+    setAlert(null);
+    try {
+      const detail = await getTemplateDetail(templateId);
+      setSelectedTemplatePreview(detail);
+      setPreviewModalOpen(true);
+    } catch (e) {
+      setAlert({ type: "error", msg: e.message || "미리보기를 불러오지 못했습니다." });
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const closeTemplatePreview = () => setPreviewModalOpen(false);
+
+  // ── 편집 내용 저장 ──────────────────────────────────────────────────────
+  const saveEditedHtml = async () => {
+    if (!result?.document_id) return;
+    setSavingEdit(true);
+    setAlert(null);
+    try {
+      await updateGeneratedDocument({
+        documentId: result.document_id,
+        htmlContent: editedHtml,
+      });
+      setAlert({ type: "success", msg: "수정 내용이 저장되었습니다." });
+    } catch (e) {
+      setAlert({ type: "error", msg: e.message || "저장 실패" });
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  // ── 이메일 발송 (editedHtml 기준) ────────────────────────────────────────
   const sendEmail = async () => {
     if (!result) return;
-
     setSending(true);
     setAlert(null);
-
     try {
-      await sendExpenseEmail(result);
+      await sendExpenseEmail(result, editedHtml);
       setAlert({
         type: "success",
         msg: `이메일을 발송했습니다. (${result.recipient_email || "수신자 없음"})`,
@@ -216,15 +235,53 @@ export default function ProcessPage() {
       )
     : [];
 
+  const handleDownloadWord = () => {
+    const html = editedHtml || "";
+
+    const wordHtml = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${result?.template_name || "document"}</title>
+  </head>
+  <body>
+  ${html}
+  </body>
+  </html>
+  `;
+
+    const blob = new Blob([wordHtml], {
+      type: "application/msword;charset=utf-8",
+    });
+
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${result?.template_name || "document"}.doc`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    URL.revokeObjectURL(url);
+  };
+
+  // ─── 렌더 ────────────────────────────────────────────────────────────────
   return (
     <div className="main-inner">
       <div className="page-title">결재서류 작성</div>
       <div className="page-desc">
-        저장된 템플릿을 선택한 뒤 자연어 설명과 영수증을 입력하면 AI가 문서를 자동 작성합니다.
+        저장된 템플릿을 선택한 뒤 자연어 설명과 증빙 이미지를 입력하면 AI가 문서를
+        자동 작성합니다.
       </div>
 
-      {alert && <div className={`alert alert-${alert.type}`}>{alert.msg}</div>}
+      {alert && (
+        <div className={`alert alert-${alert.type}`}>{alert.msg}</div>
+      )}
 
+      {/* ── [1] 문서 작성 요청 카드 ── */}
       <div className="card">
         <div className="card-title">문서 작성 요청</div>
 
@@ -243,11 +300,33 @@ export default function ProcessPage() {
           </select>
         </div>
 
-        {selectedTemplate?.placeholder_keys?.length > 0 && (
+        {selectedTemplate && (
           <div className="form-row">
-            <label>템플릿 플레이스홀더 키</label>
-            <div className="page-desc" style={{ marginBottom: 0 }}>
-              {selectedTemplate.placeholder_keys.join(", ")}
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => openTemplatePreview(selectedTemplateId)}
+                disabled={previewLoading || !selectedTemplateId}
+                style={{ width: "auto", minWidth: 120 }}
+              >
+                {previewLoading ? (
+                  <>
+                    <span className="spinner" />
+                    불러오는 중...
+                  </>
+                ) : (
+                  "선택한 템플릿 미리보기"
+                )}
+              </button>
             </div>
           </div>
         )}
@@ -263,13 +342,11 @@ export default function ProcessPage() {
         </div>
 
         <div className="form-row">
-          <label>영수증 이미지 (선택)</label>
+          <label>증빙 이미지 (선택)</label>
           <DropZone
-            label="영수증 이미지를 드래그하거나 클릭하여 업로드"
+            label="증빙 이미지를 드래그하거나 클릭하여 업로드"
             accept="image/*"
-            // file={receiptFile}
             files={receiptFiles}
-            // setFile={setReceiptFile}
             setFiles={setReceiptFiles}
             multiple
             icon="🧾"
@@ -292,11 +369,16 @@ export default function ProcessPage() {
         </button>
       </div>
 
+      {/* ── [2] 생성 결과 카드 ── */}
       {result && (
         <div className="card">
           <div
             className="card-title"
-            style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
           >
             <span>생성 결과</span>
             <span className="badge badge-ok">완료</span>
@@ -306,6 +388,7 @@ export default function ProcessPage() {
             사용 템플릿: <strong>{result.template_name}</strong>
           </div>
 
+          {/* AI 추출 데이터 */}
           <div className="result-box">
             {entries.length === 0 ? (
               <div className="page-desc" style={{ marginBottom: 0 }}>
@@ -318,7 +401,8 @@ export default function ProcessPage() {
                   key={key}
                   style={{
                     alignItems:
-                      Array.isArray(value) || (typeof value === "object" && value !== null)
+                      Array.isArray(value) ||
+                      (typeof value === "object" && value !== null)
                         ? "flex-start"
                         : "center",
                   }}
@@ -330,10 +414,12 @@ export default function ProcessPage() {
             )}
           </div>
 
+          {/* 이메일 발송 대상 */}
           <div style={{ marginTop: 20 }}>
             <div className="card-title">이메일 발송 대상</div>
             <div className="email-preview">
-              결재자: <span className="email-to">{result.recipient_name || "-"}</span>
+              결재자:{" "}
+              <span className="email-to">{result.recipient_name || "-"}</span>
               {" → "}
               <span className="email-to">
                 {result.recipient_email || "⚠ 조직도에 이메일 없음"}
@@ -341,21 +427,119 @@ export default function ProcessPage() {
             </div>
           </div>
 
+          {/* ── [3] 문서 미리보기 & 편집 영역 ── */}
           <div className="html-preview-wrap">
-            <div className="html-preview-bar">
-              <span>결재서류 미리보기</span>
-              <a
-                href={`data:text/html;charset=utf-8,${encodeURIComponent(safeHtml)}`}
-                download={`${result.template_name || "document"}.html`}
-                style={{ color: "var(--accent2)", fontSize: 11 }}
-              >
-                다운로드
-              </a>
+            {/* 상단 바 */}
+            <div
+              className="html-preview-bar"
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <span>
+                결재서류 미리보기
+                {editMode && (
+                  <span
+                    style={{
+                      marginLeft: 8,
+                      color: "var(--accent)",
+                      fontWeight: 700,
+                      fontSize: 12,
+                    }}
+                  >
+                    ✏ 편집 모드
+                  </span>
+                )}
+              </span>
+
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                {/* 편집 모드 토글 */}
+                <button
+                  type="button"
+                  className={`btn ${editMode ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setEditMode((v) => !v)}
+                  style={{ width: "auto", minWidth: 110, fontSize: 12 }}
+                >
+                  {editMode ? "미리보기 모드" : "편집 모드"}
+                </button>
+
+                {/* 수정 내용 저장 (편집 모드일 때만) */}
+                {editMode && (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={saveEditedHtml}
+                    disabled={savingEdit}
+                    style={{ width: "auto", minWidth: 110, fontSize: 12 }}
+                  >
+                    {savingEdit ? (
+                      <>
+                        <span className="spinner" />
+                        저장 중...
+                      </>
+                    ) : (
+                      "수정 내용 저장"
+                    )}
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleDownloadWord}
+                  className="btn btn-secondary"
+                >
+                  Word 다운로드
+                </button>
+              </div>
             </div>
-            <iframe srcDoc={safeHtml} sandbox="allow-same-origin" />
+
+            {/* 편집 모드 안내 문구 */}
+            {editMode && (
+              <div
+                style={{
+                  background: "rgba(99,102,241,0.08)",
+                  border: "1px solid var(--accent)",
+                  borderRadius: 6,
+                  padding: "8px 12px",
+                  marginBottom: 8,
+                  fontSize: 13,
+                  color: "var(--accent)",
+                }}
+              >
+                현재 편집 모드입니다. 문서 내용을 직접 수정한 뒤 저장하세요.
+              </div>
+            )}
+
+            {/* 편집 모드: EditableHtmlPreview */}
+            {editMode ? (
+              <EditableHtmlPreview
+                key={result.document_id}
+                html={editedHtml}
+                editable
+                onChange={setEditedHtml}
+              />
+            ) : (
+              /* 미리보기 모드: iframe (editedHtml 기준으로 최신 상태 표시) */
+              <iframe
+                srcDoc={editedHtml}
+                sandbox="allow-same-origin"
+                style={{
+                  width: "100%",
+                  minHeight: 420,
+                  border: "1px solid var(--border, #333)",
+                  borderRadius: 8,
+                  background: "#fff",
+                }}
+              />
+            )}
           </div>
 
-          <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+          {/* ── [4] 액션 버튼 ── */}
+          <div style={{ display: "flex", gap: 10, marginTop: 20, flexWrap: "wrap" }}>
             <button
               className="btn btn-primary"
               onClick={sendEmail}
@@ -375,13 +559,93 @@ export default function ProcessPage() {
               className="btn btn-secondary"
               onClick={() => {
                 setResult(null);
+                setEditedHtml("");
+                setEditMode(false);
                 setDesc("");
-                // setReceiptFile(null);
                 setReceiptFiles([]);
               }}
             >
               새 문서 작성
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── 템플릿 미리보기 모달 ── */}
+      {previewModalOpen && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 1000,
+            backgroundColor: "rgba(0, 0, 0, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 20,
+          }}
+          onClick={closeTemplatePreview}
+        >
+          <div
+            className="card"
+            style={{
+              width: "min(1100px, 96vw)",
+              height: "min(820px, 92vh)",
+              margin: 0,
+              display: "flex",
+              flexDirection: "column",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className="card-title"
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+                marginBottom: 12,
+              }}
+            >
+              <span>선택한 템플릿 미리보기</span>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={closeTemplatePreview}
+                style={{ width: "auto", minWidth: 80 }}
+              >
+                닫기
+              </button>
+            </div>
+
+            <div className="page-desc" style={{ marginBottom: 12 }}>
+              {selectedTemplatePreview?.template_name || "-"}
+              {selectedTemplatePreview?.file_name
+                ? ` (${selectedTemplatePreview.file_name})`
+                : ""}
+            </div>
+
+            {selectedTemplatePreview?.html_content ? (
+              <iframe
+                title="template-preview"
+                srcDoc={selectedTemplatePreview.html_content.replace(
+                  /<script[\s\S]*?>[\s\S]*?<\/script>/gi,
+                  ""
+                )}
+                sandbox="allow-same-origin"
+                style={{
+                  flex: 1,
+                  width: "100%",
+                  border: "1px solid #ddd",
+                  borderRadius: 8,
+                  backgroundColor: "#fff",
+                }}
+              />
+            ) : (
+              <div className="page-desc" style={{ marginBottom: 0 }}>
+                미리보기 가능한 HTML이 없습니다.
+              </div>
+            )}
           </div>
         </div>
       )}

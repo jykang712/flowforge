@@ -1,4 +1,4 @@
-const API = "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 function assertTemplateFileType(file) {
   const name = String(file?.name || "").toLowerCase();
@@ -533,8 +533,9 @@ export async function processExpense({ templateId, desc, receiptFiles = [] }) {
 
 // -----------------------------
 // 이메일 발송
+// filledHtml: 편집된 최신 HTML (없으면 result.filled_html 사용)
 // -----------------------------
-export async function sendExpenseEmail(result) {
+export async function sendExpenseEmail(result, filledHtml) {
   const res = await fetch(`${API}/api/send-email`, {
     method: "POST",
     headers: {
@@ -544,9 +545,12 @@ export async function sendExpenseEmail(result) {
       document_id: result.document_id,
       to_email: result.recipient_email,
       to_name: result.recipient_name,
-      requester: result.expense_data.requester || "작성자",
+      requester:
+        result.expense_data?.requester ||
+        result.requester_name ||
+        "작성자",
       template_name: result.template_name,
-      filled_html: result.filled_html,
+      filled_html: filledHtml !== undefined ? filledHtml : result.filled_html,
       expense_data: result.expense_data,
     }),
   });
@@ -560,6 +564,78 @@ export async function sendExpenseEmail(result) {
 }
 
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 자동작성 문서 관리 API
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 목록 조회
+export async function getGeneratedDocuments() {
+  const res = await fetch(`${API}/api/generated-documents`);
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "자동작성 문서 목록 조회 실패");
+  }
+
+  return res.json();
+}
+
+// 상세 조회
+export async function getGeneratedDocumentDetail(documentId) {
+  const res = await fetch(`${API}/api/generated-documents/${documentId}`);
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "자동작성 문서 상세 조회 실패");
+  }
+
+  return res.json();
+}
+
+// 수정 (HTML 편집 저장 또는 상태 변경)
+export async function updateGeneratedDocument({
+  documentId,
+  htmlContent,
+  extractedJson,
+  documentTitle,
+  isSent,
+}) {
+  const body = {};
+
+  if (htmlContent !== undefined) body.html_content = htmlContent;
+  if (documentTitle !== undefined) body.document_title = documentTitle;
+  if (typeof isSent === "boolean") body.is_sent = isSent;
+  if (extractedJson !== undefined) body.extracted_json = extractedJson;
+
+  const res = await fetch(`${API}/api/generated-documents/${documentId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "문서 수정 실패");
+  }
+
+  return res.json();
+}
+
+// 삭제 (비활성화)
+export async function deleteGeneratedDocument(documentId) {
+  const res = await fetch(`${API}/api/generated-documents/${documentId}`, {
+    method: "DELETE",
+  });
+
+  if (!res.ok) {
+    const e = await res.json().catch(() => null);
+    throw new Error(e?.detail || "문서 삭제 실패");
+  }
+
+  return res.json();
+}
 
 
 // 교육용 테스트 코드---------------------------------------------------------------------------------------------------------------------------

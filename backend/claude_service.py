@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import textwrap
 from dotenv import load_dotenv
 from anthropic import AsyncAnthropic
 from bs4 import BeautifulSoup
@@ -55,6 +56,91 @@ def _clean_email(value) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", "", str(value)).strip()
+
+# --------------------------------------------------------------------------------------------------
+def _compact_json(data) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _compact_org_members_for_prompt(org_members: list[dict]) -> str:
+    lines = []
+    for m in org_members or []:
+        lines.append(
+            f"{m.get('id','')}|{_clean_text(m.get('name'))}|{_clean_text(m.get('department'))}|{_clean_text(m.get('title'))}|{_clean_email(m.get('email'))}"
+        )
+    return "\n".join(lines)
+
+
+def _compact_templates_for_prompt(templates: list[dict]) -> str:
+    return "\n".join(
+        f"{t.get('id','')}|{_clean_text(t.get('template_name'))}"
+        for t in templates or []
+    )
+    
+def _filter_approval_guide_text(guide_text: str, max_chars: int = 45000) -> str:
+    if not guide_text:
+        return ""
+
+    keywords = [
+        "결재", "승인", "합의", "전결", "참조", "검토", "확인", "보고",
+        "담당", "팀장", "부서장", "본부장", "임원", "대표", "대표이사",
+        "사장", "이사", "부장", "과장",
+        "금액", "만원", "원", "이상", "이하", "초과", "미만",
+        "출장", "지출", "비용", "구매", "발주", "정산", "품의", "신청",
+        "처리", "규정", "기준", "절차", "권한", "위임"
+    ]
+
+    lines = [line.strip() for line in re.split(r"[\n\r]+", guide_text) if line.strip()]
+    picked_indexes = set()
+
+    context_size = 4
+
+    for i, line in enumerate(lines):
+        if any(keyword in line for keyword in keywords):
+            start = max(0, i - context_size)
+            end = min(len(lines), i + context_size + 1)
+
+            for j in range(start, end):
+                picked_indexes.add(j)
+
+    picked = [lines[i] for i in sorted(picked_indexes)]
+    picked_text = "\n".join(picked).strip()
+
+    # 필터 결과가 너무 적으면 필터링 실패로 보고 원문 앞부분 사용
+    if len(picked_text) < 1500:
+        return _clean_text(guide_text)[:max_chars]
+
+    return picked_text[:max_chars]
+
+def _build_field_context_from_schema(template_schema: dict) -> list[dict]:
+    properties = template_schema.get("properties", {})
+    required = set(template_schema.get("required", []))
+    result = []
+
+    for key, info in properties.items():
+        if not isinstance(info, dict):
+            continue
+
+        item = {
+            "k": key,
+            "t": info.get("type", "string"),
+        }
+
+        if key in required:
+            item["req"] = 1
+
+        desc = _clean_text(info.get("description"))
+        if desc:
+            item["desc"] = desc[:80]
+
+        title = _clean_text(info.get("title"))
+        if title:
+            item["label"] = title[:40]
+
+        result.append(item)
+
+    return result
+# ----------------------------------------------------------------------------------------------------
     
 def _to_bool(value) -> bool:
     if isinstance(value, bool):
@@ -408,10 +494,20 @@ def _build_schema_from_confirmed_fields(
             ui_type = "string"
 
         schema_type = _ui_type_to_schema_type(ui_type)
-
+        
+        desc_parts = [
+            _clean_text(field.get("description")),
+            _clean_text(label),
+            _clean_text(field.get("position_hint")),
+        ]
+        desc = " / ".join([x for x in desc_parts if x])
+        # schema_field = {
+        #     "type": schema_type,
+        #     "description": _clean_text(field.get("description") or label or key),
+        # }
         schema_field = {
             "type": schema_type,
-            "description": _clean_text(field.get("description") or label or key),
+            "description": desc or key,
         }
 
         if ui_type == "array":
@@ -492,6 +588,10 @@ def _strip_locator_attrs(soup):
 
     return soup
 
+def _remove_scripts(soup):
+    for tag in soup.find_all(["script", "noscript"]):
+        tag.decompose()
+    return soup
 
 def _set_cell_locator(tag, cell_id: str, locator_type: str):
     tag["data-cell-id"] = cell_id
@@ -1317,6 +1417,93 @@ def _extract_rows_by_layout(html: str):
     return layout_type, rows_for_ai, soup
 # ---------------------------------------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------------------------------------------------
+def _compress_rows_for_ai(rows_for_ai: list[dict]) -> dict:
+    result = {
+        "v": 1,
+        "rows": [],
+    }
+
+    for row in rows_for_ai or []:
+        layout = row.get("layout_type", "")
+        compact_row = {
+            "ly": layout,
+            "r": row.get("row_index"),
+            "cells": [],
+        }
+
+        if row.get("table_index") is not None:
+            compact_row["t"] = row.get("table_index")
+
+        if row.get("page_index") is not None:
+            compact_row["p"] = row.get("page_index")
+
+        for cell in row.get("cells", []) or []:
+            cell_id = _clean_text(cell.get("cell_id"))
+            if not cell_id:
+                continue
+
+            c = {"id": cell_id}
+
+            text = _clean_text(cell.get("text"))
+            if text:
+                c["txt"] = text[:80]
+            
+            c["fill"] = 1 if cell.get("is_fillable", True) else 0
+            # if cell.get("is_fillable") is not None:
+            #     c["fill"] = 1 if cell.get("is_fillable") else 0
+
+            if cell.get("replace_original"):
+                c["rep"] = 1
+
+            if cell.get("is_approval_like"):
+                c["apv"] = 1
+
+            left = cell.get("left_labels") or []
+            top = cell.get("above_labels") or []
+            near = cell.get("near_labels") or []
+
+            if left:
+                c["left"] = left[:3]
+
+            if top:
+                c["top"] = top[:3]
+
+            if near:
+                c["near"] = near[:3]
+
+            hint = _clean_text(cell.get("position_hint"))
+            if hint:
+                c["hint"] = hint[:60]
+
+            p_texts = cell.get("p_texts") or []
+            useful_p_texts = [
+                p for p in p_texts
+                if _looks_like_template_input_text(p)
+            ]
+            if useful_p_texts:
+                c["pt"] = useful_p_texts[:2]
+
+            if layout == "positioned_div_html":
+                pos_map = {
+                    "left": "x",
+                    "top": "y",
+                    "width": "w",
+                    "height": "h",
+                }
+                for raw_key, short_key in pos_map.items():
+                    value = cell.get(raw_key)
+                    if value is not None:
+                        c[short_key] = round(float(value), 1)
+
+            compact_row["cells"].append(c)
+
+        if compact_row["cells"]:
+            result["rows"].append(compact_row)
+
+    return result
+# -----------------------------------------------------------------------------------------------------------------
+
 def _unique_texts(values: list) -> list[str]:
     result = []
 
@@ -1406,60 +1593,61 @@ def _make_placeholder_span(soup, key: str):
         "word-break:break-all;"
         "overflow:hidden;"
         "text-overflow:clip;"
-        "font-size:7px;"
+        "font-size:9pt;"
         "line-height:1.1;"
         "vertical-align:middle;"
-        "color:#1f4ed8;"
+        "color:#000000;"
+        "font-family:Malgun Gothic, 맑은 고딕, sans-serif;"
     )
     span.string = "{{" + key + "}}"
     return span
 # -----------------------------------------------------------------------------------------------------------
 
-def _filter_fields_to_empty_cells(
-    fields: list[dict],
-    rows_for_ai: list[dict],
-) -> list[dict]:
-    cell_map = {}
+# def _filter_fields_to_empty_cells(
+#     fields: list[dict],
+#     rows_for_ai: list[dict],
+# ) -> list[dict]:
+#     cell_map = {}
 
-    for row in rows_for_ai or []:
-        for cell in row.get("cells", []) or []:
-            cell_id = _clean_text(cell.get("cell_id"))
+#     for row in rows_for_ai or []:
+#         for cell in row.get("cells", []) or []:
+#             cell_id = _clean_text(cell.get("cell_id"))
 
-            if cell_id:
-                cell_map[cell_id] = cell
+#             if cell_id:
+#                 cell_map[cell_id] = cell
 
-    filtered = []
-    used_cell_ids = set()
+#     filtered = []
+#     used_cell_ids = set()
 
-    for field in fields or []:
-        if not isinstance(field, dict):
-            continue
+#     for field in fields or []:
+#         if not isinstance(field, dict):
+#             continue
 
-        locator = field.get("locator") if isinstance(field.get("locator"), dict) else {}
-        cell_id = _clean_text(field.get("cell_id") or locator.get("cell_id"))
+#         locator = field.get("locator") if isinstance(field.get("locator"), dict) else {}
+#         cell_id = _clean_text(field.get("cell_id") or locator.get("cell_id"))
 
-        if not cell_id:
-            continue
+#         if not cell_id:
+#             continue
 
-        cell = cell_map.get(cell_id)
+#         cell = cell_map.get(cell_id)
 
-        if not cell:
-            continue
+#         if not cell:
+#             continue
 
-        # 핵심: 실제 텍스트가 있는 셀은 제외
-        if not cell.get("is_empty"):
-            continue
+#         # 핵심: 실제 텍스트가 있는 셀은 제외
+#         if not cell.get("is_empty"):
+#             continue
 
-        if _clean_text(cell.get("text")):
-            continue
+#         if _clean_text(cell.get("text")):
+#             continue
 
-        if cell_id in used_cell_ids:
-            continue
+#         if cell_id in used_cell_ids:
+#             continue
 
-        used_cell_ids.add(cell_id)
-        filtered.append(field)
+#         used_cell_ids.add(cell_id)
+#         filtered.append(field)
 
-    return filtered
+#     return filtered
 
 def _inject_placeholders_by_locator(
     soup,
@@ -1570,6 +1758,8 @@ def _inject_placeholders_by_locator(
 
     if not keep_cell_id:
         _strip_locator_attrs(soup)
+    
+    _remove_scripts(soup)
 
     return str(soup)
 
@@ -1743,63 +1933,40 @@ def _fallback_fields_from_rows(rows_for_ai: list[dict], limit: int = 60) -> list
     return fields
 
 async def _analyze_template_cells_with_claude(rows_for_ai: list[dict], template_name: str) -> list[dict]:
-    table_map_text = json.dumps(rows_for_ai, ensure_ascii=False, indent=2)
-    instructions = f"""
-너는 회사 결재서류 HTML 구조에서 자동 입력이 필요한 위치를 찾는 AI이다.
-입력 HTML은 서버에서 DOCX/HWPX 원본 문서를 변환한 결과이다.
-너는 HTML을 새로 만들지 말고, 자동 입력이 필요한 위치의 fields JSON만 출력해야 한다.
+    # table_map_text = json.dumps(rows_for_ai, ensure_ascii=False, indent=2)
+    compressed_rows = _compress_rows_for_ai(rows_for_ai)
+    table_map_text = _compact_json(compressed_rows)
+    instructions = textwrap.dedent(f"""
+    역할: 결재서류 HTML 변환 구조에서 자동입력 필드 위치를 찾는다.
+    입력은 압축 문서구조 JSON이며 HTML 원문이 아니다.
+    템플릿: {template_name}
 
-템플릿 이름은 "{template_name}"이다.
-입력은 HTML 전체가 아니라 문서 구조를 요약한 JSON이다.
+    입력 키:
+    row.ly=layout, row.t=표번호, row.r=행번호, row.p=페이지번호.
+    cell.id=출력 cell_id, cell.txt=셀텍스트, cell.fill=입력후보, cell.rep=원문교체가능.
+    cell.left/top/near/hint=주변라벨, cell.pt=입력예시문구, cell.apv=결재후보, cell.x/y/w/h=좌표.
 
-반드시 JSON 객체만 출력하라.
-설명, 해설, 코드블록 없이 순수 JSON만 출력하라.
+    순수 JSON 객체만 출력한다. 설명/마크다운/코드블록 금지.
 
-출력 형식:
-{{
-  "fields": [
-    {{
-      "label": "화면에 표시할 항목명",
-      "key": "field_name",
-      "type": "string",
-      "required": true,
-      "cell_id": "t0_r0_c0",
-      "description": "이 항목이 문서에서 의미하는 내용",
-      "position_hint": "문서 내 위치 설명"
-    }}
-  ]
-}}
+    형식:
+    {{"fields":[{{"label":"항목명","key":"field_name","type":"string","required":true,"cell_id":"t0_r0_c0","description":"필드 의미","position_hint":"문서 위치"}}]}}
 
-규칙:
-1. 반드시 입력에 존재하는 cell_id만 사용하라.
-2. 값이 들어갈 수 있는 빈칸 위치만 선택하라.
-3. 제목, 고정 문구, 설명 문구가 들어간 위치는 선택하지 마라.
-4. key는 영어 snake_case로 작성하라.
-5. type은 string, text, date, number, amount, array, boolean 중 하나만 사용하라.
-6. table_html에서는 빈 td/th 중 왼쪽 또는 위쪽 라벨이 있는 칸을 우선 선택하라.
-7. positioned_div_html에서는 .hce 좌표형 셀을 의미한다. is_empty가 true이고 near_labels 또는 position_hint가 있는 셀을 우선 선택하라.
-8. positioned_div_html에서 같은 행 왼쪽 라벨이 "소속", "성명", "신청금액", "출장처", "출장목적", "출장기간", "예정정산일", "출납", "비고", "합계", "정산액"이면 오른쪽 빈칸을 자동 입력 후보로 선택하라.
-8-1. 입력 JSON의 p_texts는 td/th 내부 p 태그의 텍스트이다.
-p_texts에 "20 년 월 일 ~ 20 년 월 일", "금 원", "○○○ 귀하"처럼 사용자가 채워야 하는 기본 양식 문구가 있으면 해당 셀은 입력 대상일 수 있다.
-단, "출장확인", "월일", "출발지", "도착지", "업무내용"처럼 컬럼명이나 라벨이면 입력 대상으로 선택하지 마라.
-9. 결재란/승인란/확인란의 담당, 팀장, 담당임원, 임원, 사장, 과장, 부장, 이사, 대표이사 아래 또는 옆 입력칸은 필요하면 다음 key로 잡아라.
-- 담당: approval_staff_name
-- 팀장: approval_team_leader_name
-- 담당임원/임원: approval_executive_name
-- 사장/대표/대표이사: approval_ceo_name
-- 과장: approval_manager_name
-- 부장: approval_general_manager_name
-- 이사: approval_director_name
-10. fields에는 사용자가 화면에서 확인하고 수정할 자동 입력 항목만 넣어라.
-11. JSON 외의 어떤 문장도 출력하지 마라.
-12. fields는 최대 60개까지만 출력하라.
-13. label은 20자 이내로 작성하라.
-14. description은 40자 이내로 작성하라.
-15. position_hint는 40자 이내로 작성하라.
-16. 문자열 안에 줄바꿈을 넣지 마라.
-17. 큰따옴표가 필요한 문장은 만들지 마라.
-18. 확실한 빈칸만 fields에 포함하라.
-"""
+    규칙:
+    1. cell_id는 입력 cell.id 중 하나만 사용한다.
+    2. cell.fill=1인 셀만 선택한다.
+    3. cell.txt가 있고 cell.rep!=1이면 선택하지 않는다.
+    4. 제목/고정문구/설명문구/컬럼명은 제외한다.
+    5. table_html은 left/top 라벨이 있는 입력 가능 셀을 우선한다.
+    6. positioned_div_html은 near/hint가 있는 빈 셀을 우선한다.
+    7. pt에 날짜/금액/○○○ 귀하 등 입력 예시가 있으면 후보가 될 수 있다.
+    8. 출장확인/월일/출발지/도착지/업무내용 등 컬럼명은 제외한다.
+    9. 결재란 key: 담당=approval_staff_name, 팀장=approval_team_leader_name, 임원=approval_executive_name, 대표/대표이사=approval_ceo_name, 과장=approval_manager_name, 부장=approval_general_manager_name, 이사=approval_director_name.
+    10. key는 영어 snake_case.
+    11. type은 string,text,date,number,amount,array,boolean 중 하나.
+    12. fields 최대 60개.
+    13. label 20자 이내, description/position_hint 40자 이내.
+    14. 확실한 자동입력 칸만 포함한다.
+    """).strip()
     response = await client.messages.create(
         model=CLAUDE_TEMPLATE_MODEL,
         max_tokens=8192,
@@ -1823,6 +1990,7 @@ async def convert_template_to_schema(
 ) -> dict:
     confirmed_fields = confirmed_fields or []
     layout_type, rows_for_ai, soup = _extract_rows_by_layout(source_text)
+    soup = _remove_scripts(soup)
 
     if confirmed_fields:
         fields = confirmed_fields
@@ -1877,32 +2045,22 @@ async def preview_org_members_from_image(
     image_b64: str,
     image_mime: str,
 ) -> list[dict]:
-    instructions = """
-너는 회사 조직도/인사표/주소록 표 이미지를 읽어 조직원 정보를 JSON 배열로 구조화하는 AI이다.
+    instructions = textwrap.dedent("""
+    역할: 조직도/인사표/주소록 이미지를 읽어 조직원 JSON 배열을 만든다.
+    순수 JSON 배열만 출력한다. 설명/마크다운/코드블록 금지.
 
-반드시 JSON 배열만 출력하라.
-설명, 해설, 코드블록, 마크다운 없이 순수 JSON만 출력하라.
+    형식:
+    [{"name":"","department":"","title":"","email":""}]
 
-출력 형식:
-[
-  {
-    "name": "홍길동",
-    "department": "개발팀",
-    "title": "팀장",
-    "email": "hong@company.com"
-  }
-]
-
-규칙:
-1. 표의 각 사람 행을 하나의 객체로 만들어라.
-2. 헤더 행은 제외하라.
-3. 이름, 부서, 직급(또는 직책/직급), 이메일 컬럼을 최대한 정확히 읽어라.
-4. 직책/직급처럼 합쳐진 컬럼이면 title에 그대로 넣어라.
-5. 이메일은 공백 없이 반환하라.
-6. 보이지 않거나 불명확한 값은 빈 문자열로 둬라.
-7. 추측하지 말고 이미지에 실제로 보이는 정보만 사용하라.
-8. 이름/직급/이메일이 모두 비어 있는 행은 제외하라.
-"""
+    규칙:
+    1. 사람 행만 추출하고 헤더는 제외한다.
+    2. 이름/부서/직급·직책/이메일을 보이는 대로 입력한다.
+    3. 직급·직책이 합쳐진 컬럼은 title에 그대로 둔다.
+    4. 이메일 공백은 제거한다.
+    5. 없거나 불명확한 값은 빈 문자열로 둔다.
+    6. 이미지에 없는 정보는 추측하지 않는다.
+    7. name/title/email이 모두 비면 제외한다.
+    """).strip()
 
     response = await client.messages.create(
         model=CLAUDE_LIGHT_MODEL,
@@ -1940,60 +2098,57 @@ async def preview_approval_rules_from_guide(
     templates: list[dict],
     org_members: list[dict],
 ) -> list[dict]:
-    template_lines = []
-    for t in templates:
-        template_lines.append(
-            f"- template_id: {t['id']}, template_name: {t['template_name']}"
-        )
+    # template_lines = []
+    # for t in templates:
+    #     template_lines.append(
+    #         f"- template_id: {t['id']}, template_name: {t['template_name']}"
+    #     )
 
-    org_lines = []
-    for m in org_members:
-        org_lines.append(
-            f"- member_id: {m['id']}, name: {m['name']}, department: {m.get('department','')}, title: {m['title']}, email: {m['email']}"
-        )
+    # org_lines = []
+    # for m in org_members:
+    #     org_lines.append(
+    #         f"- member_id: {m['id']}, name: {m['name']}, department: {m.get('department','')}, title: {m['title']}, email: {m['email']}"
+    #     )
+    template_text = _compact_templates_for_prompt(templates)
+    org_text = _compact_org_members_for_prompt(org_members)
 
-    instructions = f"""
-너는 회사 결재 처리 방침 초안을 만드는 AI이다.
-사용자가 업로드한 지침서를 읽고, 저장 가능한 결재 처리 방침 후보를 JSON 배열로 생성하라.
+    filtered_guide = _filter_approval_guide_text(guide_text)
 
-[사용 가능한 템플릿 목록]
-{chr(10).join(template_lines)}
+    if len(filtered_guide) < 1500:
+        filtered_guide = _clean_text(guide_text)[:45000]
 
-[사용 가능한 조직도 목록]
-{chr(10).join(org_lines)}
 
-[지침서 내용]
-{guide_text[:45000]}
+    user_payload = {
+        "templates": template_text,
+        "org_members": org_text,
+        # "guide": _clean_text(guide_text)[:45000],
+        "guide": filtered_guide,
+    }
 
-반드시 JSON 배열만 출력하라.
-설명, 해설, 코드블록, 마크다운 없이 순수 JSON만 출력하라.
+    instructions = textwrap.dedent("""
+    역할: 결재 지침서에서 저장 가능한 결재 처리 규칙 후보를 추출한다.
+    입력은 templates/org_members/guide를 담은 JSON이다.
 
-출력 형식:
-[
-  {{
-    "rule_name": "규칙명",
-    "rule_text": "규칙 설명",
-    "template_id": 1,
-    "source_excerpt": "지침서 근거 문장",
-    "approvers": [
-      {{
-        "approver_member_id": 3,
-        "approval_order": 1,
-        "approval_type": "결재"
-      }}
-    ]
-  }}
-]
+    입력 형식:
+    - templates: 줄 단위 id|template_name
+    - org_members: 줄 단위 id|name|department|title|email
+    - guide: 결재 지침서 텍스트
 
-규칙:
-1. 반드시 제공된 template_id 중 하나만 사용하라.
-2. 반드시 제공된 approver_member_id 중 하나만 사용하라.
-3. approval_type은 "결재", "합의", "최종승인", "참조" 중 하나만 사용하라.
-4. approvers는 approval_order 오름차순으로 구성하라.
-5. 지침서에 근거가 명확한 규칙만 생성하라.
-6. 너무 애매하면 생성하지 말라.
-7. source_excerpt에는 규칙 판단의 핵심 근거 문장을 짧게 넣어라.
-"""
+    순수 JSON 배열만 출력한다. 설명/마크다운/코드블록 금지.
+
+    형식:
+    [{"rule_name":"","rule_text":"","template_id":1,"source_excerpt":"","approvers":[{"approver_member_id":1,"approval_order":1,"approval_type":"결재"}]}]
+
+    규칙:
+    1. template_id는 입력 templates의 id만 사용한다.
+    2. approver_member_id는 입력 org_members의 id만 사용한다.
+    3. approval_type은 결재, 합의, 최종승인, 참조 중 하나.
+    4. approvers는 approval_order 오름차순.
+    5. guide에 근거가 명확한 규칙만 생성한다.
+    6. 애매한 규칙은 생성하지 않는다.
+    7. source_excerpt는 판단 근거 문장을 짧게 적는다.
+    8. 같은 의미의 규칙은 중복 생성하지 않는다.
+    """).strip()
 
     response = await client.messages.create(
         model=CLAUDE_LIGHT_MODEL,
@@ -2003,7 +2158,7 @@ async def preview_approval_rules_from_guide(
         messages=[
             {
                 "role": "user",
-                "content": "결재 처리 방침 초안을 JSON 배열로 생성하세요.",
+                "content": _compact_json(user_payload),
             }
         ],
     )
@@ -2026,51 +2181,34 @@ async def extract_expense_data(
 
     org_list = _build_org_list(org_chart)
 
-    schema_text = json.dumps(template_schema, ensure_ascii=False, indent=2)
+    # schema_text = json.dumps(template_schema, ensure_ascii=False, indent=2)
+    field_context = _build_field_context_from_schema(template_schema)
+    field_context_text = _compact_json(field_context)
 
     receipt_count = len(receipt_images)
 
-    instructions = f"""
-너는 회사 결재서류 자동 작성 AI이다.
-사용자가 선택한 템플릿 형식과 JSON Schema에 맞춰 문서 작성용 데이터를 추출하라.
-사용자의 자연어 설명, 여러 장의 영수증 이미지, 결재 규칙, 조직도를 함께 참고해야 한다.
+    instructions = textwrap.dedent(f"""
+    역할: 결재서류 작성용 JSON 데이터를 생성한다.
+    템플릿: {template_name}
+    필드목록: {field_context_text}
+    결재규칙: {_clean_text(approval_rules)[:6000]}
+    조직도: {_clean_text(org_list)[:6000]}
+    영수증이미지수: {receipt_count}
 
-=== 선택된 템플릿 이름 ===
-{template_name}
+    순수 JSON 객체만 출력한다. 설명/마크다운/코드블록 금지.
 
-=== 선택된 템플릿 HTML ===
-{template_html}
-
-=== 이 템플릿의 JSON Schema ===
-{schema_text}
-
-=== 결재 규칙 ===
-{approval_rules}
-
-=== 조직도 ===
-{org_list}
-
-=== 첨부된 영수증 이미지 수 ===
-{receipt_count}개
-
-반드시 위 JSON Schema를 만족하는 JSON 객체만 출력하라.
-설명, 해설, 코드블록, 마크다운 없이 JSON 객체만 출력하라.
-
-규칙:
-1. 반드시 JSON Schema의 properties에 정의된 필드만 사용하라.
-2. JSON Schema에 없는 필드는 절대 추가하지 마라.
-3. 템플릿 HTML 안의 placeholder 문맥을 참고해서 각 필드값을 자연스럽게 채워라.
-4. 영수증 이미지가 여러 장 있으면 모든 이미지를 함께 확인하라.
-5. 여러 영수증에 금액, 품목, 날짜가 나누어져 있으면 문서 목적에 맞게 합산하거나 정리하라.
-6. 자연어 설명과 영수증 정보가 충돌하면 영수증 이미지의 실제 정보를 더 우선하라.
-7. 영수증 이미지가 일부 흐리거나 누락된 정보가 있으면 자연어 설명을 보조 근거로 사용하라.
-8. 결재자 관련 필드는 템플릿 본문에 실제로 필요한 경우에만 채워라. 메일 수신자 결정은 서버가 별도로 처리하므로 결재자 추론에 과도하게 집착하지 마라.
-9. 숫자형 필드는 숫자로 반환하라. 쉼표, 원, 공백, 문자열 금지.
-10. 문자열 필드는 null 대신 가능한 범위에서 추정한 문자열을 넣어라.
-11. 날짜 필드는 템플릿 문맥에 맞는 형식으로 작성하라.
-12. 배열 필드가 있으면 여러 영수증의 품목을 가능한 한 행 단위로 정리하라.
-13. JSON 외의 어떤 문장도 출력하지 않는다.
-"""
+    규칙:
+    1. 필드목록의 k만 key로 사용한다.
+    2. 필드목록에 없는 key는 추가하지 않는다.
+    3. t가 integer/number이면 숫자로 반환한다. 쉼표/원/공백/문자열 금지.
+    4. boolean은 true/false로 반환한다.
+    5. array는 여러 영수증 품목·내역을 행 단위로 정리한다.
+    6. string은 null 대신 가능한 문자열을 넣는다.
+    7. 날짜는 문서 문맥에 맞게 작성한다.
+    8. 사용자 설명과 영수증이 충돌하면 영수증을 우선한다.
+    9. 흐리거나 누락된 정보는 사용자 설명을 보조 근거로 사용한다.
+    10. 결재자 관련 필드는 템플릿 필드에 있을 때만 채운다.
+    """).strip()
 
     user_content = []
 

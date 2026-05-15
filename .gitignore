@@ -1,7 +1,6 @@
 # Backend env
 backend/.env
 backend/.env.*
-!backend/.env.example
 
 # Python
 backend/__pycache__/
